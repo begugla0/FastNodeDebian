@@ -44,6 +44,9 @@ error()   { _log "ERROR"   "$@"; echo -e "${RED} ✗${NC} $*"; }
 success() { _log "SUCCESS" "$@"; echo -e "${GREEN} ✓${NC} $*"; }
 
 export -f info warn error success _log
+# Экспортируем и цвета: дочерние модули используют унаследованные функции,
+# которые ссылаются на эти переменные (критично для модулей с set -u).
+export RED GREEN YELLOW BLUE CYAN BOLD NC
 
 # ── Проверки запуска ─────────────────────────────────────────────────────────
 
