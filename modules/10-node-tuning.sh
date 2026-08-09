@@ -110,19 +110,29 @@ esac
 [[ ${RPF} -eq 0 ]] && warn "rp_filter=0: защита от подмены исходного адреса отключена"
 
 # ── 5. Лимиты дескрипторов ────────────────────────────────────────────────────
-if [[ -n "${TUNE_NOFILE:-}" ]]; then
-    NOFILE="${TUNE_NOFILE}"
-elif (( RAM_MB <= 1200 )); then
-    NOFILE=65535
-elif (( RAM_MB <= 4096 )); then
-    NOFILE=262144
-else
-    NOFILE=1048576
-fi
-# nr_open — верхняя граница для nofile, поэтому не может быть меньше
-NR_OPEN="${NOFILE}"
-FILE_MAX=$(( NOFILE * 2 ))
-info "Лимит дескрипторов: ${NOFILE}"
+# Сам по себе лимит памяти не занимает — она расходуется только на реально
+# открытые дескрипторы. Поэтому масштабировать потолок по объёму RAM смысла нет,
+# а вред есть: на VPS с 1 ГБ прежняя формула давала fs.nr_open=65535, то есть
+# ОПУСКАЛА штатный потолок ядра (1048576) вместо того, чтобы его поднять.
+NOFILE="${TUNE_NOFILE:-1048576}"
+[[ "${NOFILE}" =~ ^[0-9]+$ ]] || die "TUNE_NOFILE должно быть числом, получено '${NOFILE}'"
+
+# Текущие значения ядра: понижать их нельзя ни при каких настройках
+CUR_NR_OPEN="$(sysctl -n fs.nr_open 2>/dev/null || echo 1048576)"
+CUR_FILE_MAX="$(sysctl -n fs.file-max 2>/dev/null || echo 0)"
+[[ "${CUR_NR_OPEN}"  =~ ^[0-9]+$ ]] || CUR_NR_OPEN=1048576
+[[ "${CUR_FILE_MAX}" =~ ^[0-9]+$ ]] || CUR_FILE_MAX=0
+
+max_of() { local m="$1"; shift; local v; for v in "$@"; do (( v > m )) && m="${v}"; done; printf '%s' "${m}"; }
+
+# fs.nr_open — жёсткий потолок для любого nofile. Обязан быть не меньше и
+# самого лимита, и штатного значения ядра.
+NR_OPEN="$(max_of "${NOFILE}" "${CUR_NR_OPEN}" 1048576)"
+FILE_MAX="$(max_of $(( NOFILE * 2 )) "${CUR_FILE_MAX}")"
+
+info "Лимит дескрипторов: nofile=${NOFILE}, fs.nr_open=${NR_OPEN}, fs.file-max=${FILE_MAX}"
+(( NR_OPEN > CUR_NR_OPEN )) && info "Потолок хоста поднимается: ${CUR_NR_OPEN} → ${NR_OPEN}"
+true
 
 # ── 6. Буферы под профиль ─────────────────────────────────────────────────────
 if [[ "${PROFILE}" == "proxy" ]]; then
@@ -220,8 +230,10 @@ net.ipv4.icmp_ignore_bogus_error_responses = 1
 kernel.kptr_restrict = 2
 
 # ── Файловые дескрипторы ─────────────────────────────────────────────────────
-fs.file-max = ${FILE_MAX}
+# fs.nr_open — потолок для LimitNOFILE и ulimit -n. Если он ниже, чем
+# DefaultLimitNOFILE, systemd не сможет запустить службу.
 fs.nr_open = ${NR_OPEN}
+fs.file-max = ${FILE_MAX}
 fs.inotify.max_user_instances = 8192
 EOF
 
@@ -260,6 +272,19 @@ root hard nofile ${NOFILE}
 * soft nproc unlimited
 * hard nproc unlimited
 EOF
+
+# Потолок должен действовать УЖЕ СЕЙЧАС, иначе systemd отвергнет
+# DefaultLimitNOFILE и службы не поднимутся до перезагрузки.
+LIVE_NR_OPEN="$(sysctl -n fs.nr_open 2>/dev/null || echo 0)"
+if [[ "${LIVE_NR_OPEN}" =~ ^[0-9]+$ ]] && (( LIVE_NR_OPEN < NOFILE )); then
+    warn "fs.nr_open=${LIVE_NR_OPEN} меньше запрошенного nofile=${NOFILE}"
+    if sysctl -w "fs.nr_open=${NR_OPEN}" >/dev/null 2>&1; then
+        success "Потолок поднят на лету: fs.nr_open=${NR_OPEN}"
+    else
+        warn "Не удалось поднять fs.nr_open (контейнер?) — снижаем nofile до ${LIVE_NR_OPEN}"
+        NOFILE="${LIVE_NR_OPEN}"
+    fi
+fi
 
 mkdir -p /etc/systemd/system.conf.d /etc/systemd/user.conf.d
 printf '[Manager]\nDefaultLimitNOFILE=%s\nDefaultLimitNPROC=infinity\n' "${NOFILE}" \
