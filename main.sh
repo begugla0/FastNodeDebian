@@ -1,203 +1,248 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # ==============================================================================
 # FastNodeDebian — main.sh
-# Debian 9 / 10 / 11 / 12 / 13 Server Automation
-# Version: 1.0.0
+#
+# Рабочая платформа модулей настройки: Debian 13 (trixie).
+# Debian 9/10/11/12 обслуживаются единственным модулем 00 — обновлением до 13.
+#
+# Использование:
+#   bash main.sh                    интерактивное меню
+#   bash main.sh --all              все модули настройки без меню
+#   bash main.sh --module 05        один модуль по номеру (0–10)
+#   bash main.sh --upgrade          поэтапное обновление до Debian 13
+#   bash main.sh --all --yes        без единого вопроса
 # ==============================================================================
 
-set -euo pipefail
+set -Eeuo pipefail
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-CYAN='\033[0;36m'
-BOLD='\033[1m'
-NC='\033[0m'
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export FASTNODE_ROOT="${SCRIPT_DIR}"
 
-# SCRIPT_DIR: при curl|bash устанавливается из run.sh, иначе вычисляем сами
-if [[ -z "${SCRIPT_DIR:-}" ]]; then
-    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-fi
+# shellcheck source=lib/common.sh
+source "${SCRIPT_DIR}/lib/common.sh"
 
 MODULES_DIR="${SCRIPT_DIR}/modules"
-CONFIG_DIR="${SCRIPT_DIR}/config"
-LOGS_DIR="${SCRIPT_DIR}/logs"
-LOG_FILE="${LOGS_DIR}/setup_$(date +%Y%m%d_%H%M%S).log"
+LOG_FILE="${SCRIPT_DIR}/logs/session_$(date +%Y%m%d_%H%M%S).log"
+mkdir -p "${SCRIPT_DIR}/logs"
+export LOG_FILE
 
-# ── Проверка конфига ────────────────────────────────────────────────────────
+load_settings
+trap_setup "main"
 
-if [[ ! -f "${CONFIG_DIR}/settings.conf" ]]; then
-    echo -e "${RED}[ERROR] Конфиг не найден: ${CONFIG_DIR}/settings.conf${NC}"
-    exit 1
+# ── Аргументы ─────────────────────────────────────────────────────────────────
+ACTION="menu"
+ONE_MODULE=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --all|-a)            ACTION="all" ;;
+        --upgrade|-u)        ACTION="upgrade" ;;
+        --module|-m)         shift; ONE_MODULE="${1:-}"; ACTION="one" ;;
+        --module=*)          ONE_MODULE="${1#*=}"; ACTION="one" ;;
+        --yes|-y)            export FASTNODE_YES=1 ;;
+        --non-interactive|-n) export FASTNODE_NONINTERACTIVE=1 ;;
+        --status)            ACTION="status" ;;
+        --help|-h)           sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        *)                   warn "Неизвестный аргумент: $1" ;;
+    esac
+    shift
+done
+
+# Совместимость со старым способом запуска: INTERACTIVE_MODE=false bash main.sh
+if [[ "${INTERACTIVE_MODE:-true}" == "false" ]]; then
+    export FASTNODE_NONINTERACTIVE=1
+    [[ "${ACTION}" == "menu" ]] && ACTION="all"
 fi
-source "${CONFIG_DIR}/settings.conf"
 
-# ── Логирование ─────────────────────────────────────────────────────────────
-
-mkdir -p "${LOGS_DIR}"
-
-_log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$1] ${*:2}" >> "${LOG_FILE}"; }
-info()    { _log "INFO"    "$@"; echo -e "${CYAN} ℹ${NC} $*"; }
-warn()    { _log "WARN"    "$@"; echo -e "${YELLOW} ⚠${NC} $*"; }
-error()   { _log "ERROR"   "$@"; echo -e "${RED} ✗${NC} $*"; }
-success() { _log "SUCCESS" "$@"; echo -e "${GREEN} ✓${NC} $*"; }
-
-export -f info warn error success _log
-# Экспортируем и цвета: дочерние модули используют унаследованные функции,
-# которые ссылаются на эти переменные (критично для модулей с set -u).
-export RED GREEN YELLOW BLUE CYAN BOLD NC
-
-# ── Проверки запуска ─────────────────────────────────────────────────────────
-
-check_root() {
-    if [[ ${EUID} -ne 0 ]]; then
-        error "Запустите скрипт от root: sudo bash main.sh"
-        exit 1
-    fi
-}
-
-check_debian() {
-    if ! grep -qi "debian" /etc/os-release 2>/dev/null && [[ ! -r /etc/debian_version ]]; then
-        error "Этот скрипт предназначен для Debian 9–13"
-        exit 1
-    fi
-
-    local ver major codename
-    ver="$(. /etc/os-release 2>/dev/null; echo "${VERSION_ID:-}")"
-    codename="$(. /etc/os-release 2>/dev/null; echo "${VERSION_CODENAME:-}")"
-    major="${ver%%.*}"
-
-    if [[ -z "${major}" ]]; then
-        warn "Не удалось точно определить версию Debian — продолжаем"
-    elif [[ "${major}" -lt 9 ]]; then
-        warn "Debian ${ver} (${codename}) — слишком старая, поддерживаются 9–13"
-    elif [[ "${major}" -gt 13 ]]; then
-        info "Debian ${ver} (${codename}) — новее протестированных, обычно работает ✓"
-    else
-        info "Debian ${ver} (${codename}) — поддерживается ✓"
-    fi
-}
-
-# ── Запуск модуля ────────────────────────────────────────────────────────────
+# ── Каталог модулей ───────────────────────────────────────────────────────────
+declare -A MODULE_FILE=(
+    [0]="00-system-update.sh"
+    [1]="01-packet-update.sh"
+    [2]="02-locale-setup.sh"
+    [3]="03-time-sync.sh"
+    [4]="04-ssh-key.sh"
+    [5]="05-ssh-hardening.sh"
+    [6]="06-swap-setup.sh"
+    [7]="07-ufw-setup.sh"
+    [8]="08-fail2ban-setup.sh"
+    [9]="09-xanmod-v3.sh"
+    [10]="10-node-tuning.sh"
+)
+SETUP_ORDER=(1 2 3 4 5 6 7 8 10)
 
 run_module() {
-    local module="$1"
-    local path="${MODULES_DIR}/${module}"
+    local key="$1" file rc=0
+    file="${MODULE_FILE[${key}]:-}"
+    [[ -n "${file}" ]] || { warn "Нет модуля с номером ${key}"; return 1; }
+    local path="${MODULES_DIR}/${file}"
+    [[ -f "${path}" ]] || { warn "Файл модуля не найден: ${path}"; return 1; }
 
-    if [[ ! -f "${path}" ]]; then
-        warn "Модуль не найден: ${path}"
-        return 1
-    fi
+    printf '\n%s%s%s\n' "${C_BLUE}" "$(printf '━%.0s' {1..62})" "${C_NC}"
+    printf '%s Модуль %s%s%s\n' "${C_BLUE}" "${C_BOLD}" "${file}" "${C_NC}"
+    printf '%s%s%s\n' "${C_BLUE}" "$(printf '━%.0s' {1..62})" "${C_NC}"
 
-    echo ""
-    echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo -e "${BLUE} Модуль: ${BOLD}${module}${NC}"
-    echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    bash "${path}" || rc=$?
 
-    export LOG_FILE SCRIPT_DIR CONFIG_DIR MODULES_DIR
-
-    if bash "${path}"; then
-        success "Модуль ${module} — выполнен"
-    else
-        warn "Модуль ${module} завершился с ошибкой (код: $?)"
-    fi
+    case "${rc}" in
+        0)  success "Модуль ${file} выполнен" ;;
+        90) warn "Модуль ${file} пропущен: требуется Debian 13" ;;
+        *)  error "Модуль ${file} завершился с кодом ${rc}" ;;
+    esac
+    return "${rc}"
 }
 
 run_all() {
-    info "Запуск всех модулей настройки (1-8)..."
-    # 00-system-update (ребут!) и 09-xanmod (ребут!) запускаются ТОЛЬКО вручную
-    for mod in $(ls -1 "${MODULES_DIR}"/*.sh 2>/dev/null | sort); do
-        local name
-        name="$(basename "${mod}")"
-        if [[ "${name}" == "00-system-update.sh" || "${name}" == "09-xanmod-v3.sh" ]]; then
-            continue
-        fi
-        run_module "${name}"
+    local failed=() k rc
+    info "Запуск модулей настройки: ${SETUP_ORDER[*]}"
+    for k in "${SETUP_ORDER[@]}"; do
+        rc=0
+        run_module "${k}" || rc=$?
+        [[ ${rc} -ne 0 ]] && failed+=("${MODULE_FILE[${k}]}")
     done
 
-    echo ""
-    printf "${YELLOW} Запустить 09-xanmod-v3.sh (установка ядра, требует перезагрузку)? (y/n): ${NC}"
-    local run_xanmod
-    read -r run_xanmod </dev/tty
-    if [[ "${run_xanmod}" =~ ^[Yy]$ ]]; then
-        run_module "09-xanmod-v3.sh"
+    echo
+    if [[ ${#failed[@]} -gt 0 ]]; then
+        warn "Завершились с ошибкой: ${failed[*]}"
+        info "Подробности: ${LOG_FILE}"
     else
-        info "Пропускаем XanMod. Запустите позже: bash modules/09-xanmod-v3.sh"
+        success "Все модули настройки выполнены"
+    fi
+
+    # Модуль 09 требует перезагрузки, поэтому только по явному согласию
+    # и только когда есть кому ответить.
+    echo
+    if confirm "Установить ядро XanMod (модуль 09, требует перезагрузки)?" no; then
+        run_module 9 || true
+    else
+        info "XanMod пропущен. Позже:  bash main.sh --module 9"
     fi
 }
 
-# ── Главное меню ─────────────────────────────────────────────────────────────
-
+# ── Меню ──────────────────────────────────────────────────────────────────────
 show_menu() {
-    clear
-    echo ""
-    echo -e "${CYAN}  ╔══════════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}  ║   ⚡ FastNodeDebian v1.0 — Debian 9 → 13         ║${NC}"
-    echo -e "${CYAN}  ╚══════════════════════════════════════════════════╝${NC}"
-    echo ""
-    echo -e "  ${CYAN}10${NC}) Поэтапное обновление Debian (9→10→11→12→13) ${YELLOW}[reboot]${NC}"
-    echo ""
-    echo -e "  ${CYAN} 1${NC}) Обновление пакетов системы"
-    echo -e "  ${CYAN} 2${NC}) Настройка локали (${LOCALE_LANG})"
-    echo -e "  ${CYAN} 3${NC}) Синхронизация времени (${TIMEZONE})"
-    echo -e "  ${CYAN} 4${NC}) Установка SSH ключа"
-    echo -e "  ${CYAN} 5${NC}) SSH Hardening (порт ${SSH_PORT})"
-    echo -e "  ${CYAN} 6${NC}) Настройка SWAP (выбор: 1/2/3/4 GB)"
-    echo -e "  ${CYAN} 7${NC}) Настройка UFW Firewall"
-    echo -e "  ${CYAN} 8${NC}) Настройка Fail2Ban"
-    echo -e "  ${CYAN} 9${NC}) XanMod ядро + BBRv3 ${YELLOW}[требует reboot, Debian 12/13]${NC}"
-    echo ""
-    echo -e "  ${GREEN}111${NC}) Выполнить ВСЕ модули настройки (1-8 + опционально 9)"
-    echo -e "  ${RED}  0${NC}) Выход"
-    echo ""
-    echo -e "  ${BLUE}Конфиг:${NC} ${CONFIG_DIR}/settings.conf"
-    echo -e "  ${BLUE}Лог:${NC}    ${LOG_FILE}"
-    echo ""
-}
+    local major="$1"
+    clear 2>/dev/null || true
+    banner "⚡ FastNodeDebian v${FASTNODE_VERSION}"
+    printf '  Система: %sDebian %s (%s)%s   Ядро: %s\n\n' \
+        "${C_GREEN}" "${major}" "$(os_codename)" "${C_NC}" "$(uname -r)"
 
-# ── Точка входа ─────────────────────────────────────────────────────────────
-
-main() {
-    check_root
-    check_debian
-
-    info "FastNodeDebian v1.0.0 | Ядро: $(uname -r) | Дата: $(date '+%Y-%m-%d %H:%M')"
-
-    # Автоматический режим (INTERACTIVE_MODE=false bash main.sh)
-    if [[ "${INTERACTIVE_MODE:-true}" == "false" ]]; then
-        run_all
-        success "Настройка завершена! Лог: ${LOG_FILE}"
-        return 0
+    if [[ "${major}" -lt 13 ]]; then
+        printf '  %sМодули настройки требуют Debian 13. Доступно только обновление.%s\n\n' \
+            "${C_YELLOW}" "${C_NC}"
+        printf '   %s u%s) Поэтапное обновление до Debian 13  %s[перезагрузки]%s\n' \
+            "${C_CYAN}" "${C_NC}" "${C_YELLOW}" "${C_NC}"
+        printf '   %s s%s) Статус обновления\n' "${C_CYAN}" "${C_NC}"
+    else
+        printf '   %s 1%s) Обновление пакетов системы\n'            "${C_CYAN}" "${C_NC}"
+        printf '   %s 2%s) Локаль (%s)\n'                           "${C_CYAN}" "${C_NC}" "${LOCALE_LANG:-ru_RU.UTF-8}"
+        printf '   %s 3%s) Время и часовой пояс (%s)\n'             "${C_CYAN}" "${C_NC}" "${TIMEZONE:-Europe/Moscow}"
+        printf '   %s 4%s) SSH ключ\n'                              "${C_CYAN}" "${C_NC}"
+        printf '   %s 5%s) SSH hardening (порт %s)\n'               "${C_CYAN}" "${C_NC}" "${SSH_PORT:-2225}"
+        printf '   %s 6%s) SWAP\n'                                  "${C_CYAN}" "${C_NC}"
+        printf '   %s 7%s) UFW firewall\n'                          "${C_CYAN}" "${C_NC}"
+        printf '   %s 8%s) Fail2Ban\n'                              "${C_CYAN}" "${C_NC}"
+        printf '   %s 9%s) Ядро XanMod + BBR  %s[перезагрузка]%s\n' "${C_CYAN}" "${C_NC}" "${C_YELLOW}" "${C_NC}"
+        printf '   %s10%s) Тюнинг узла (BBR, буферы, conntrack, лимиты)\n' "${C_CYAN}" "${C_NC}"
+        printf '\n'
+        printf '   %s u%s) Обновление дистрибутива (уже на 13 — ничего не делает)\n' "${C_CYAN}" "${C_NC}"
+        printf '   %s a%s) Выполнить модули 1–8 и 10 подряд\n'      "${C_GREEN}" "${C_NC}"
+        printf '   %s v%s) Проверить состояние узла\n'              "${C_CYAN}" "${C_NC}"
     fi
 
-    # Интерактивный режим
-    while true; do
-        show_menu
-        printf "  Выберите модуль: "
-        local choice
-        read -r choice </dev/tty
-
-        case "${choice}" in
-            10|00) run_module "00-system-update.sh" ;;
-            1)   run_module "01-packet-update.sh" ;;
-            2)   run_module "02-locale-setup.sh" ;;
-            3)   run_module "03-time-sync.sh" ;;
-            4)   run_module "04-ssh-key.sh" ;;
-            5)   run_module "05-ssh-hardening.sh" ;;
-            6)   run_module "06-swap-setup.sh" ;;
-            7)   run_module "07-ufw-setup.sh" ;;
-            8)   run_module "08-fail2ban-setup.sh" ;;
-            9)   run_module "09-xanmod-v3.sh" ;;
-            111) run_all ;;
-            0)   info "Выход"; echo ""; exit 0 ;;
-            *)   echo -e "  ${RED}Неверный выбор: ${choice}${NC}" ;;
-        esac
-
-        echo ""
-        printf "  Нажмите Enter для возврата в меню..."
-        read -r </dev/tty
-    done
+    printf '   %s 0%s) Выход\n\n' "${C_RED}" "${C_NC}"
+    printf '  %sКонфиг:%s %s\n'  "${C_GREY}" "${C_NC}" "${FASTNODE_CONFIG:-config/settings.conf}"
+    printf '  %sЛог:%s    %s\n\n' "${C_GREY}" "${C_NC}" "${LOG_FILE}"
 }
 
-main "$@"
+node_status() {
+    if [[ -x /usr/local/bin/fastnode-verify ]]; then
+        /usr/local/bin/fastnode-verify | sed 's/^/   /'
+    else
+        printf '   Ядро:      %s\n' "$(uname -r)"
+        printf '   SSH порты: %s\n' "$(sshd_effective_ports 2>/dev/null | paste -sd, - || echo '?')"
+        printf '   UFW:       %s\n' "$(ufw status 2>/dev/null | head -1 || echo 'не установлен')"
+        printf '   Fail2Ban:  %s\n' "$(systemctl is-active fail2ban 2>/dev/null || echo 'не установлен')"
+        printf '   SWAP:      %s MB\n' "$(free -m | awk '/^Swap:/{print $2}')"
+    fi
+}
+
+# ── Точка входа ───────────────────────────────────────────────────────────────
+require_root
+is_debian || die "FastNodeDebian предназначен только для Debian."
+
+MAJOR="$(os_major)"
+[[ -n "${MAJOR}" ]] || die "Не удалось определить версию Debian."
+
+log_raw INFO "FastNodeDebian ${FASTNODE_VERSION} | Debian ${MAJOR} | $(uname -r)"
+
+case "${ACTION}" in
+    status)  node_status; exit 0 ;;
+    upgrade) run_module 0; exit $? ;;
+    one)
+        # Принимаем «5», «05» и полное имя файла модуля
+        MOD_KEY=""
+        if [[ "${ONE_MODULE}" =~ ^0*([0-9]|10)$ ]]; then
+            MOD_KEY="${BASH_REMATCH[1]}"
+        else
+            for k in "${!MODULE_FILE[@]}"; do
+                if [[ "${MODULE_FILE[${k}]}" == "${ONE_MODULE}" \
+                   || "${MODULE_FILE[${k}]}" == "${ONE_MODULE}.sh" ]]; then
+                    MOD_KEY="${k}"
+                    break
+                fi
+            done
+        fi
+        [[ -n "${MOD_KEY}" ]] || die "Нет модуля '${ONE_MODULE}'. Допустимо 0–9 или имя файла из modules/"
+        run_module "${MOD_KEY}"; exit $?
+        ;;
+    all)
+        if [[ "${MAJOR}" -lt 13 ]]; then
+            error "Обнаружен Debian ${MAJOR}. Модули настройки требуют Debian 13."
+            info  "Сначала обновитесь:  bash main.sh --upgrade"
+            exit 90
+        fi
+        run_all
+        success "Готово. Лог: ${LOG_FILE}"
+        exit 0
+        ;;
+esac
+
+# ── Интерактивное меню ────────────────────────────────────────────────────────
+if ! interactive; then
+    die "Нет терминала для меню. Используйте --all, --module N или --upgrade."
+fi
+
+while true; do
+    MAJOR="$(os_major)"
+    show_menu "${MAJOR}"
+    printf '  Выберите пункт: ' > /dev/tty
+    CHOICE=""
+    read -r CHOICE < /dev/tty || break
+
+    case "${CHOICE}" in
+        0)          info "Выход"; exit 0 ;;
+        u|U|00)     run_module 0 || true ;;
+        10)         run_module 10 || true ;;
+        s|S)        bash "${MODULES_DIR}/00-system-update.sh" --status || true ;;
+        v|V)        node_status ;;
+        a|A|111)
+            if [[ "${MAJOR}" -lt 13 ]]; then
+                error "Требуется Debian 13. Пункт 10 — обновление."
+            else
+                run_all
+            fi
+            ;;
+        [1-9])
+            if [[ "${MAJOR}" -lt 13 ]]; then
+                error "Модуль ${CHOICE} требует Debian 13. Сначала пункт 10."
+            else
+                run_module "${CHOICE}" || true
+            fi
+            ;;
+        "")         continue ;;
+        *)          error "Неверный выбор: ${CHOICE}" ;;
+    esac
+
+    printf '\n  Enter — вернуться в меню...' > /dev/tty
+    read -r < /dev/tty || break
+done

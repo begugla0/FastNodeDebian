@@ -1,133 +1,170 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # ==============================================================================
-# Module 00: Поэтапное обновление дистрибутива Debian
-#   9 (stretch) → 10 (buster) → 11 (bullseye) → 12 (bookworm) → 13 (trixie)
+# Модуль 00 — Поэтапное обновление Debian до 13 (trixie)
+#   9 stretch → 10 buster → 11 bullseye → 12 bookworm → 13 trixie
 #
-# Особенности:
-#   - Обновляет ровно на ОДНУ мажорную версию за запуск, затем перезагрузка.
-#   - Корректно переключает sources.list:
-#       * stretch/buster      → archive.debian.org (EOL, Check-Valid-Until off)
-#       * bullseye            → live-зеркало, авто-фолбэк на archive
-#       * bookworm/trixie     → live-зеркало (deb.debian.org / security.debian.org)
-#   - Формат security-suite: <=10 → "<codename>/updates", >=11 → "<codename>-security"
-#   - Компонент non-free-firmware добавляется начиная с Debian 12.
+# Единственный модуль, работающий на Debian 9–12. Все остальные модули
+# требуют уже обновлённую до 13 систему.
 #
 # Режимы:
-#   bash 00-system-update.sh                 # один шаг + запрос перезагрузки (ручной)
-#   bash 00-system-update.sh --auto          # ВЕСЬ путь до 13 автоматически (с ребутами)
-#   bash 00-system-update.sh --auto --target 12   # авто до выбранной версии
-#   bash 00-system-update.sh --status        # показать текущее состояние
-#   bash 00-system-update.sh --resume        # внутренний вызов из systemd после ребута
-#   Флаги: --yes/-y (без подтверждений), --target N (целевая версия, по умолчанию 13)
+#   bash 00-system-update.sh                  один шаг + предложение перезагрузки
+#   bash 00-system-update.sh --auto           вся цепочка до 13 с авто-перезагрузками
+#   bash 00-system-update.sh --auto --yes     то же без подтверждений
+#   bash 00-system-update.sh --status         состояние и маршрут
+#   bash 00-system-update.sh --restore-repos  вернуть отключённые сторонние репы
+#   bash 00-system-update.sh --abort          отменить авто-режим и снять systemd-юнит
+#   bash 00-system-update.sh --resume         внутренний вызов из systemd
 #
-# ⚠ Перед запуском сделайте резервную копию / снапшот! Операция необратима.
+# ⚠ Апгрейд дистрибутива необратим. Снапшот перед запуском обязателен.
 # ==============================================================================
 
-set -uo pipefail
+set -Eeuo pipefail
 
-# ── Цвета: определяем ВСЕГДА ────────────────────────────────────────────────
-# Важно при set -u: если info()/warn() унаследованы из main.sh, блок ниже
-# пропускается, а эти функции обращаются к $CYAN/$GREEN/$BOLD. Поэтому цвета
-# должны быть определены безусловно, иначе — "unbound variable".
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
-CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
+_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../lib/common.sh
+source "${_DIR}/../lib/common.sh"
+load_settings
+trap_setup "00-system-update"
 
-# ── Fallback-функции (для standalone-запуска) ───────────────────────────────
-if ! declare -f info > /dev/null 2>&1; then
-    info()    { echo -e "${CYAN} ℹ ${*}${NC}"; }
-    warn()    { echo -e "${YELLOW} ⚠ ${*}${NC}"; }
-    success() { echo -e "${GREEN} ✓ ${*}${NC}"; }
-    error()   { echo -e "${RED} ✗ ${*}${NC}"; }
-fi
-
-# ── Константы ────────────────────────────────────────────────────────────────
+# ── Константы ─────────────────────────────────────────────────────────────────
 declare -A CODENAME=( [9]=stretch [10]=buster [11]=bullseye [12]=bookworm [13]=trixie )
-DEFAULT_TARGET=13
+MIN_SUPPORTED=9
+MAX_SUPPORTED=13
 
 STATE_DIR="/var/lib/fastnode-upgrade"
 STATE_FILE="${STATE_DIR}/state.env"
-SELF_INSTALL="/usr/local/sbin/fastnode-system-update.sh"
+REPO_LIST="${STATE_DIR}/disabled-repos.list"
+SELF_INSTALL="/usr/local/sbin/fastnode-system-update"
+LIB_INSTALL="/usr/local/lib/fastnode/common.sh"
+CONF_INSTALL="/usr/local/lib/fastnode/settings.conf"
 SERVICE_NAME="fastnode-upgrade.service"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}"
 UPGRADE_LOG="/var/log/fastnode-upgrade.log"
 ARCHIVE_CONF="/etc/apt/apt.conf.d/99fastnode-archive"
 
-export DEBIAN_FRONTEND=noninteractive
-export NEEDRESTART_MODE=a
-export APT_LISTCHANGES_FRONTEND=none
+# Разрешаем apt менять Suite/Codename/Version при смене релиза.
+# Без этого apt-get update возвращает ненулевой код на каждом шаге апгрейда,
+# и вся цепочка вставала — главная причина неработоспособности прошлой версии.
+RELEASEINFO_OPTS=(
+    -o Acquire::AllowReleaseInfoChange::Suite=true
+    -o Acquire::AllowReleaseInfoChange::Version=true
+    -o Acquire::AllowReleaseInfoChange::Codename=true
+    -o Acquire::AllowReleaseInfoChange::Origin=true
+    -o Acquire::AllowReleaseInfoChange::Label=true
+    -o Acquire::AllowReleaseInfoChange::Defaultpin=true
+)
 
-# ── Логирование шага в файл ──────────────────────────────────────────────────
-_ulog() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "${UPGRADE_LOG}" 2>/dev/null || true; }
+TARGET="${UPGRADE_TARGET:-13}"
+ASSUME_YES=0
+MODE="manual"
 
-# ── Определение текущей мажорной версии ──────────────────────────────────────
-current_major() {
-    local v=""
-    if [[ -r /etc/os-release ]]; then
-        v="$(. /etc/os-release 2>/dev/null; echo "${VERSION_ID:-}")"
+ulog() { printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "${UPGRADE_LOG}" 2>/dev/null || true; }
+
+# ── Разбор аргументов ─────────────────────────────────────────────────────────
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --auto)          MODE="auto" ;;
+            --resume)        MODE="resume" ;;
+            --status)        MODE="status" ;;
+            --restore-repos) MODE="restore" ;;
+            --abort)         MODE="abort" ;;
+            --yes|-y)        ASSUME_YES=1; FASTNODE_YES=1 ;;
+            --target)        shift; TARGET="${1:-13}" ;;
+            --target=*)      TARGET="${1#*=}" ;;
+            --help|-h)       sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+            *)               warn "Неизвестный аргумент: $1" ;;
+        esac
+        shift
+    done
+    export FASTNODE_YES="${FASTNODE_YES:-0}"
+    if [[ -z "${CODENAME[${TARGET}]:-}" ]]; then
+        die "Недопустимая целевая версия: ${TARGET} (поддерживается ${MIN_SUPPORTED}–${MAX_SUPPORTED})"
     fi
-    if [[ -z "${v}" && -r /etc/debian_version ]]; then
-        local dv; dv="$(cut -d'.' -f1 /etc/debian_version 2>/dev/null)"
-        if [[ "${dv}" =~ ^[0-9]+$ ]]; then
-            v="${dv}"
-        else
-            # /etc/debian_version может содержать codename (напр. "trixie/sid")
-            local cn; cn="$(echo "${dv}" | cut -d'/' -f1)"
-            local k
-            for k in "${!CODENAME[@]}"; do
-                [[ "${CODENAME[$k]}" == "${cn}" ]] && v="${k}"
-            done
+    if [[ "${TARGET}" -ne 13 ]]; then
+        warn "Целевая версия ${TARGET} отличается от 13; модули настройки требуют именно Debian 13."
+    fi
+}
+
+# ── Предполётные проверки ─────────────────────────────────────────────────────
+preflight() {
+    require_root
+    is_debian || die "Это не Debian."
+    touch "${UPGRADE_LOG}" 2>/dev/null || true
+
+    local root_mb boot_mb
+    root_mb="$(free_mb /)"
+    if [[ -n "${root_mb}" && "${root_mb}" -lt 3072 ]]; then
+        warn "На / свободно ${root_mb} MB. Для апгрейда релиза рекомендуется ≥ 3072 MB."
+        confirm "Продолжить несмотря на нехватку места?" no || exit 1
+    fi
+    if mountpoint -q /boot 2>/dev/null; then
+        boot_mb="$(free_mb /boot)"
+        if [[ -n "${boot_mb}" && "${boot_mb}" -lt 200 ]]; then
+            warn "На /boot свободно ${boot_mb} MB — установка нового ядра может провалиться."
+            info "Удалите старые ядра:  apt-get --purge autoremove"
         fi
     fi
-    echo "${v%%.*}"
 }
 
-# ── Проверки окружения ───────────────────────────────────────────────────────
-preflight() {
-    if [[ ${EUID} -ne 0 ]]; then
-        error "Запустите от root: sudo bash 00-system-update.sh"
-        exit 1
-    fi
-    if ! grep -qi 'debian' /etc/os-release 2>/dev/null && [[ ! -r /etc/debian_version ]]; then
-        error "Это не Debian. Скрипт предназначен только для Debian 9–13."
-        exit 1
-    fi
-    if ! command -v systemctl >/dev/null 2>&1; then
-        warn "systemd не обнаружен — авто-режим (--auto) будет недоступен."
-    fi
-    # Предупреждение по свободному месту на /
-    local free_mb
-    free_mb="$(df -Pm / 2>/dev/null | awk 'NR==2{print $4}')"
-    if [[ -n "${free_mb}" && "${free_mb}" -lt 2048 ]]; then
-        warn "Мало свободного места на / : ${free_mb} MB (рекомендуется ≥ 2048 MB)."
+# Приводим dpkg/apt в согласованное состояние перед любыми операциями
+heal_dpkg() {
+    local audit; audit="$(dpkg --audit 2>/dev/null || true)"
+    [[ -n "${audit//[[:space:]]/}" ]] && warn "dpkg сообщает о незавершённых операциях — исправляем"
+    dpkg --configure -a || warn "dpkg --configure -a завершился с ошибками"
+    apt-get -f install -y "${APT_CONF_OPTS[@]}" || warn "apt-get -f install завершился с ошибками"
+}
+
+check_holds() {
+    local holds
+    holds="$(apt-mark showhold 2>/dev/null | tr '\n' ' ' || true)"
+    if [[ -n "${holds// /}" ]]; then
+        warn "Пакеты на удержании (hold) могут заблокировать апгрейд: ${holds}"
+        if confirm "Снять удержание с этих пакетов?" no; then
+            # shellcheck disable=SC2086
+            apt-mark unhold ${holds} >/dev/null 2>&1 || true
+            success "Удержание снято"
+        fi
     fi
 }
 
-# ── Резервная копия источников APT ───────────────────────────────────────────
-backup_apt() {
-    local stamp; stamp="$(date +%Y%m%d_%H%M%S)"
-    [[ -f /etc/apt/sources.list ]] && cp -a /etc/apt/sources.list "/etc/apt/sources.list.fastnode.${stamp}.bak"
-    info "Бэкап sources.list → /etc/apt/sources.list.fastnode.${stamp}.bak"
-}
-
-# ── Временно отключаем сторонние репозитории (частая причина сбоя апгрейда) ──
+# ── Сторонние репозитории ─────────────────────────────────────────────────────
 disable_thirdparty() {
-    local f changed=0
+    local f count=0
+    mkdir -p "${STATE_DIR}"
     shopt -s nullglob
     for f in /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
         [[ -e "${f}" ]] || continue
         mv "${f}" "${f}.fastnode-disabled"
-        warn "Отключён сторонний репозиторий: $(basename "${f}") (восстановите вручную после апгрейда)"
-        changed=1
+        printf '%s\n' "${f}" >> "${REPO_LIST}"
+        warn "Отключён сторонний репозиторий: $(basename "${f}")"
+        count=$((count + 1))
     done
     shopt -u nullglob
-    [[ ${changed} -eq 1 ]] && _ulog "disabled third-party sources.list.d entries"
+    [[ ${count} -gt 0 ]] && ulog "disabled ${count} third-party repos"
     return 0
 }
 
-# ── Запись /etc/apt/sources.list для конкретного релиза ──────────────────────
-# Аргументы: <major> <codename> <mode: live|archive>
+restore_thirdparty() {
+    [[ -f "${REPO_LIST}" ]] || { info "Список отключённых репозиториев пуст."; return 0; }
+    local f n=0
+    while IFS= read -r f; do
+        [[ -n "${f}" ]] || continue
+        if [[ -e "${f}.fastnode-disabled" ]]; then
+            mv "${f}.fastnode-disabled" "${f}"
+            success "Восстановлен: $(basename "${f}")"
+            n=$((n + 1))
+        fi
+    done < "${REPO_LIST}"
+    rm -f "${REPO_LIST}"
+    warn "Проверьте, что восстановленные репозитории поддерживают Debian ${TARGET}, затем: apt-get update"
+    info "Восстановлено записей: ${n}"
+}
+
+# ── Формирование sources.list ─────────────────────────────────────────────────
+# _write_sources <major> <codename> <live|archive> <with_updates:0|1>
 _write_sources() {
-    local major="$1" cn="$2" mode="$3"
+    local major="$1" cn="$2" mode="$3" with_updates="$4"
     local components="main contrib non-free"
     [[ "${major}" -ge 12 ]] && components="main contrib non-free non-free-firmware"
 
@@ -135,8 +172,7 @@ _write_sources() {
     if [[ "${mode}" == "archive" ]]; then
         base="http://archive.debian.org/debian"
         sec="http://archive.debian.org/debian-security"
-        # отключаем проверку срока действия Release для архива
-        echo 'Acquire::Check-Valid-Until "false";' > "${ARCHIVE_CONF}"
+        printf 'Acquire::Check-Valid-Until "false";\n' > "${ARCHIVE_CONF}"
     else
         base="http://deb.debian.org/debian"
         sec="http://security.debian.org/debian-security"
@@ -144,134 +180,163 @@ _write_sources() {
     fi
 
     if [[ "${major}" -le 10 ]]; then
-        sec_suite="${cn}/updates"          # stretch/buster: старый формат
+        sec_suite="${cn}/updates"
     else
-        sec_suite="${cn}-security"         # bullseye+: новый формат
+        sec_suite="${cn}-security"
     fi
 
     {
-        echo "# Сгенерировано FastNodeDebian 00-system-update.sh ($(date))"
-        echo "# Релиз: Debian ${major} (${cn}) | mode=${mode}"
-        echo "deb ${base} ${cn} ${components}"
-        echo "deb ${base} ${cn}-updates ${components}"
-        echo "deb ${sec} ${sec_suite} ${components}"
+        printf '# Сгенерировано FastNodeDebian (модуль 00) %s\n' "$(date)"
+        printf '# Debian %s (%s), режим=%s\n\n' "${major}" "${cn}" "${mode}"
+        printf 'deb %s %s %s\n' "${base}" "${cn}" "${components}"
+        [[ "${with_updates}" == "1" ]] && printf 'deb %s %s-updates %s\n' "${base}" "${cn}" "${components}"
+        printf 'deb %s %s %s\n' "${sec}" "${sec_suite}" "${components}"
     } > /etc/apt/sources.list
 }
 
-# ── Настроить источники с авто-фолбэком live→archive и проверкой apt update ──
-# Аргументы: <major> <codename>
+apt_update_release() {
+    local rc=0
+    apt-get update "${APT_CONF_OPTS[@]}" "${RELEASEINFO_OPTS[@]}" >>"${UPGRADE_LOG}" 2>&1 || rc=$?
+    return "${rc}"
+}
+
+_apt_run() {
+    local rc=0
+    "$@" >>"${UPGRADE_LOG}" 2>&1 || rc=$?
+    return "${rc}"
+}
+
+# configure_sources <major> <codename>
 configure_sources() {
     local major="$1" cn="$2"
-    local modes=()
-
+    local -a modes
     if [[ "${major}" -le 10 ]]; then
-        modes=(archive)                    # stretch/buster всегда из архива
-    elif [[ "${major}" -eq 11 ]]; then
-        modes=(live archive)               # bullseye: live, иначе archive
+        modes=(archive)          # stretch/buster давно в архиве
     else
-        modes=(live archive)               # bookworm/trixie: практически всегда live
+        modes=(live archive)
     fi
 
-    local m
+    local m u
     for m in "${modes[@]}"; do
-        info "Источники для ${cn} (${m})..."
-        _write_sources "${major}" "${cn}" "${m}"
-        if apt-get update -o Acquire::Retries=3 >/dev/null 2>&1; then
-            success "apt update OK (${cn}, ${m})"
-            _ulog "sources configured: ${cn} ${m}"
-            return 0
-        fi
-        warn "apt update не прошёл для ${cn} (${m})"
+        for u in 1 0; do
+            info "Источники ${cn}: режим=${m}, -updates=${u}"
+            _write_sources "${major}" "${cn}" "${m}" "${u}"
+            if apt_update_release >/dev/null; then
+                success "apt update успешен (${cn}, ${m})"
+                ulog "sources ok: ${cn} ${m} updates=${u}"
+                return 0
+            fi
+            warn "apt update не прошёл (${cn}, ${m}, updates=${u})"
+        done
     done
-    error "Не удалось настроить рабочие источники для ${cn}."
+    error "Не удалось подобрать рабочие источники для ${cn}. Подробности: ${UPGRADE_LOG}"
     return 1
 }
 
-# ── apt upgrade/full-upgrade с безопасными опциями ───────────────────────────
-APT_OPTS=(-y -o Dpkg::Options::=--force-confold -o Dpkg::Options::=--force-confdef)
-
-_do_upgrade() {
-    apt-get upgrade "${APT_OPTS[@]}"      || warn "apt upgrade завершился с предупреждениями"
-    apt-get full-upgrade "${APT_OPTS[@]}" || warn "apt full-upgrade завершился с предупреждениями"
-    apt-get --purge autoremove -y         || true
-    apt-get autoclean -y                  || true
-}
-
-# ── Полностью обновить ТЕКУЩИЙ релиз перед прыжком ──────────────────────────
-update_current() {
-    local cur="$1" cn="${CODENAME[$1]}"
-    info "Приведение текущего релиза Debian ${cur} (${cn}) к актуальному состоянию..."
-    configure_sources "${cur}" "${cn}" || return 1
-    apt-get install -y debian-archive-keyring ca-certificates >/dev/null 2>&1 || true
-    _do_upgrade
-    success "Debian ${cur} обновлён в пределах релиза."
-}
-
-# ── Один прыжок: from → from+1 ───────────────────────────────────────────────
-upgrade_one_hop() {
-    local from="$1"
-    local to=$(( from + 1 ))
-    local to_cn="${CODENAME[$to]}"
-
-    if [[ -z "${to_cn}" ]]; then
-        error "Нет данных для перехода на Debian ${to}."
-        return 1
+# ── Апгрейд ───────────────────────────────────────────────────────────────────
+do_full_upgrade() {
+    local label="$1"
+    info "${label}: apt-get upgrade... (вывод в ${UPGRADE_LOG})"
+    if ! _apt_run apt-get upgrade -y "${APT_CONF_OPTS[@]}" "${RELEASEINFO_OPTS[@]}"; then
+        warn "upgrade завершился с ошибками, пробуем восстановиться"
+        heal_dpkg
     fi
 
-    echo ""
-    echo -e "${BOLD}${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo -e "${BOLD}${CYAN}   Апгрейд: Debian ${from} (${CODENAME[$from]}) → ${to} (${to_cn})${NC}"
-    echo -e "${BOLD}${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    _ulog "=== HOP ${from} -> ${to} (${to_cn}) START ==="
+    info "${label}: apt-get full-upgrade..."
+    if ! _apt_run apt-get full-upgrade -y "${APT_CONF_OPTS[@]}" "${RELEASEINFO_OPTS[@]}"; then
+        warn "full-upgrade завершился с ошибками — вторая попытка после восстановления"
+        heal_dpkg
+        if ! _apt_run apt-get full-upgrade -y "${APT_CONF_OPTS[@]}" "${RELEASEINFO_OPTS[@]}"; then
+            error "full-upgrade не удался. Смотрите ${UPGRADE_LOG}"
+            return 1
+        fi
+    fi
 
-    # 1) Подтянуть текущий релиз
-    update_current "${from}" || return 1
-
-    # 2) Переключить источники на следующий релиз
-    backup_apt
-    configure_sources "${to}" "${to_cn}" || return 1
-
-    # 3) Минимальный upgrade, затем полный dist-upgrade
-    info "Этап 1/2: apt-get upgrade на ${to_cn}..."
-    apt-get upgrade "${APT_OPTS[@]}" || warn "upgrade с предупреждениями"
-
-    info "Этап 2/2: apt-get full-upgrade (dist-upgrade) на ${to_cn}..."
-    apt-get full-upgrade "${APT_OPTS[@]}" || warn "full-upgrade с предупреждениями"
-
-    apt-get --purge autoremove -y || true
+    apt-get --purge autoremove -y "${APT_CONF_OPTS[@]}" >/dev/null 2>&1 || true
     apt-get clean || true
-
-    local new_major; new_major="$(current_major)"
-    _ulog "=== HOP ${from} -> ${to} DONE, now reports ${new_major} ==="
-    success "Переход на Debian ${to} (${to_cn}) выполнен. Текущая версия по системе: ${new_major}"
-    info "Требуется ПЕРЕЗАГРУЗКА для активации нового ядра."
     return 0
 }
 
-# ── Установка self + systemd-юнита для авто-продолжения после ребутов ───────
-install_resume_service() {
-    local target="$1"
-    mkdir -p "${STATE_DIR}"
-    cat > "${STATE_FILE}" <<EOF
-TARGET=${target}
-AUTO=1
-STARTED_AT=$(date '+%Y-%m-%d %H:%M:%S')
-EOF
+# Подтягиваем текущий релиз до актуального состояния перед прыжком
+update_current() {
+    local cur="$1" cn="${CODENAME[$1]}"
+    step "Актуализация текущего релиза Debian ${cur} (${cn})"
+    configure_sources "${cur}" "${cn}" || return 1
+    apt_install debian-archive-keyring ca-certificates apt >/dev/null 2>&1 || true
+    do_full_upgrade "Debian ${cur}" || return 1
+    success "Debian ${cur} обновлён в пределах релиза"
+}
 
-    # Копируем сам скрипт в стабильный путь (переживает ребут)
-    cp -f "${BASH_SOURCE[0]}" "${SELF_INSTALL}" 2>/dev/null || cp -f "$0" "${SELF_INSTALL}"
-    chmod +x "${SELF_INSTALL}"
+# Один прыжок from → from+1
+upgrade_one_hop() {
+    local from="$1" to to_cn
+    to=$(( from + 1 ))
+    to_cn="${CODENAME[${to}]:-}"
+    [[ -n "${to_cn}" ]] || { error "Нет данных для перехода на Debian ${to}"; return 1; }
+
+    step "Апгрейд: Debian ${from} (${CODENAME[${from}]}) → ${to} (${to_cn})"
+    ulog "=== HOP ${from} -> ${to} START ==="
+
+    heal_dpkg
+    check_holds
+    update_current "${from}" || return 1
+
+    backup_file /etc/apt/sources.list >/dev/null
+    configure_sources "${to}" "${to_cn}" || return 1
+
+    # Ключи нового релиза: ставим сразу после переключения источников,
+    # иначе подпись Release может не пройти проверку на следующем шаге.
+    apt_install debian-archive-keyring >/dev/null 2>&1 || true
+    apt_update_release >/dev/null || warn "Повторный apt update прошёл с замечаниями"
+
+    do_full_upgrade "Debian ${to}" || return 1
+
+    local now; now="$(os_major)"
+    ulog "=== HOP ${from} -> ${to} DONE (system reports ${now}) ==="
+    success "Переход выполнен. Система сообщает: Debian ${now} (${to_cn})"
+    info "Для активации нового ядра нужна перезагрузка."
+    return 0
+}
+
+# ── systemd-автопродолжение ───────────────────────────────────────────────────
+state_set() {
+    mkdir -p "${STATE_DIR}"
+    local k="$1" v="$2"
+    touch "${STATE_FILE}"
+    sed -i "/^${k}=/d" "${STATE_FILE}"
+    printf '%s=%s\n' "${k}" "${v}" >> "${STATE_FILE}"
+}
+
+install_resume_service() {
+    require_systemd
+    mkdir -p "${STATE_DIR}" "$(dirname "${LIB_INSTALL}")"
+    state_set TARGET "${TARGET}"
+    state_set AUTO 1
+    state_set FAILED 0
+    state_set STARTED_AT "$(date '+%Y-%m-%dT%H:%M:%S')"
+
+    # Копируем скрипт и библиотеку в стабильные пути: каталог репозитория
+    # может оказаться недоступен после перезагрузки.
+    install -m 0755 "${BASH_SOURCE[0]}" "${SELF_INSTALL}"
+    install -m 0644 "${FASTNODE_ROOT}/lib/common.sh" "${LIB_INSTALL}"
+    [[ -r "${FASTNODE_CONFIG:-}" ]] && install -m 0644 "${FASTNODE_CONFIG}" "${CONF_INSTALL}"
+    # Внутри /usr/local/sbin относительный путь ../lib/common.sh указывает
+    # ровно на /usr/local/lib/common.sh — кладём симлинк для совместимости.
+    ln -sfn "${LIB_INSTALL}" /usr/local/lib/common.sh
 
     cat > "${SERVICE_FILE}" <<EOF
 [Unit]
-Description=FastNodeDebian chained dist-upgrade (resume)
+Description=FastNodeDebian staged dist-upgrade (resume after reboot)
 After=network-online.target
 Wants=network-online.target
 ConditionPathExists=${STATE_FILE}
 
 [Service]
 Type=oneshot
-ExecStart=${SELF_INSTALL} --resume
+RemainAfterExit=no
+Environment=FASTNODE_CONFIG=${CONF_INSTALL}
+Environment=FASTNODE_NONINTERACTIVE=1
+ExecStart=${SELF_INSTALL} --resume --yes
 StandardOutput=journal+console
 StandardError=journal+console
 TimeoutStartSec=0
@@ -282,176 +347,179 @@ EOF
 
     systemctl daemon-reload
     systemctl enable "${SERVICE_NAME}" >/dev/null 2>&1
-    success "Авто-продолжение установлено (systemd: ${SERVICE_NAME})."
+    success "Авто-продолжение установлено (${SERVICE_NAME}), лог: ${UPGRADE_LOG}"
 }
 
 remove_resume_service() {
+    systemd_present || return 0
     systemctl disable "${SERVICE_NAME}" >/dev/null 2>&1 || true
-    rm -f "${SERVICE_FILE}"
-    systemctl daemon-reload 2>/dev/null || true
+    rm -f "${SERVICE_FILE}" "${SELF_INSTALL}" "${LIB_INSTALL}" "${CONF_INSTALL}" /usr/local/lib/common.sh
+    rmdir /usr/local/lib/fastnode 2>/dev/null || true
+    systemctl daemon-reload >/dev/null 2>&1 || true
     rm -f "${STATE_FILE}"
-    rm -f "${SELF_INSTALL}"
-    success "Авто-продолжение отключено и очищено."
+    success "Авто-режим отключён, временные файлы удалены"
 }
 
-# ── Перезагрузка ─────────────────────────────────────────────────────────────
+# Останавливаем цепочку так, чтобы сервер не ушёл в цикл перезагрузок
+pause_auto() {
+    state_set FAILED 1
+    systemd_present && systemctl disable "${SERVICE_NAME}" >/dev/null 2>&1 || true
+    error "Цепочка остановлена. После ручного разбора продолжите:"
+    info  "  ${SELF_INSTALL} --resume   (или заново: bash modules/00-system-update.sh --auto)"
+    ulog "chain paused after failure"
+}
+
 do_reboot() {
-    info "Перезагрузка через 5 секунд... (Ctrl+C чтобы отменить)"
+    info "Перезагрузка через 5 секунд... (Ctrl+C — отмена)"
     sleep 5
-    _ulog "rebooting"
+    ulog "rebooting"
     systemctl reboot 2>/dev/null || reboot
 }
 
-# ── Статус ───────────────────────────────────────────────────────────────────
+# ── Статус ────────────────────────────────────────────────────────────────────
+route_string() {
+    local from="$1" to="$2" s out=""
+    for (( s = from; s <= to; s++ )); do
+        out+="${s}"
+        [[ ${s} -lt ${to} ]] && out+="→"
+    done
+    printf '%s' "${out}"
+}
+
 show_status() {
-    local cur; cur="$(current_major)"
-    echo ""
-    echo -e "  ${BOLD}FastNodeDebian — статус обновления${NC}"
-    echo -e "  Текущая версия:  ${GREEN}Debian ${cur} (${CODENAME[$cur]:-?})${NC}"
+    local cur; cur="$(os_major)"
+    printf '\n  %sFastNodeDebian — статус обновления%s\n' "${C_BOLD}" "${C_NC}"
+    printf '  Текущая версия:  %sDebian %s (%s)%s\n' "${C_GREEN}" "${cur}" "${CODENAME[${cur}]:-?}" "${C_NC}"
+    printf '  Целевая версия:  Debian %s (%s)\n' "${TARGET}" "${CODENAME[${TARGET}]:-?}"
+    if [[ "${cur}" -lt "${TARGET}" ]]; then
+        printf '  Маршрут:         %s\n' "$(route_string "${cur}" "${TARGET}")"
+    else
+        printf '  Маршрут:         %sцель достигнута%s\n' "${C_GREEN}" "${C_NC}"
+    fi
     if [[ -f "${STATE_FILE}" ]]; then
         # shellcheck source=/dev/null
         source "${STATE_FILE}"
-        echo -e "  Авто-режим:      ${GREEN}включён${NC} (цель: Debian ${TARGET:-?}, старт: ${STARTED_AT:-?})"
-        echo -e "  systemd-юнит:    ${SERVICE_NAME}"
+        if [[ "${FAILED:-0}" == "1" ]]; then
+            printf '  Авто-режим:      %sприостановлен после ошибки%s\n' "${C_RED}" "${C_NC}"
+        else
+            printf '  Авто-режим:      %sактивен%s (старт: %s)\n' "${C_GREEN}" "${C_NC}" "${STARTED_AT:-?}"
+        fi
     else
-        echo -e "  Авто-режим:      выключен"
+        printf '  Авто-режим:      выключен\n'
     fi
-    echo -e "  Лог:             ${UPGRADE_LOG}"
-    echo ""
-}
-
-# ── Целевая версия из аргументов / state ────────────────────────────────────
-TARGET="${DEFAULT_TARGET}"
-ASSUME_YES=0
-MODE="manual"   # manual | auto | resume | status
-
-parse_args() {
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            --auto)    MODE="auto" ;;
-            --resume)  MODE="resume" ;;
-            --status)  MODE="status" ;;
-            --yes|-y)  ASSUME_YES=1 ;;
-            --target)  shift; TARGET="${1:-$DEFAULT_TARGET}" ;;
-            --target=*) TARGET="${1#*=}" ;;
-            --help|-h)
-                grep -E '^#( |!)' "$0" | sed -E 's/^#!?//' | head -n 40
-                exit 0 ;;
-            *) warn "Неизвестный аргумент: $1" ;;
-        esac
-        shift
-    done
-    # валидация target
-    if [[ -z "${CODENAME[$TARGET]:-}" ]]; then
-        error "Недопустимая целевая версия: ${TARGET} (допустимо 9–13)"
-        exit 1
+    if [[ -f "${REPO_LIST}" ]]; then
+        printf '  Откл. репозиториев: %s (вернуть: --restore-repos)\n' "$(wc -l < "${REPO_LIST}")"
     fi
+    printf '  Лог:             %s\n\n' "${UPGRADE_LOG}"
 }
 
-confirm() {
-    [[ ${ASSUME_YES} -eq 1 ]] && return 0
-    local prompt="$1"
-    printf "%b" "${YELLOW}${prompt} (yes/no): ${NC}"
-    local a; read -r a </dev/tty 2>/dev/null || a="no"
-    [[ "${a}" == "yes" ]]
+warning_box() {
+    printf '%s' "${C_YELLOW}"
+    cat <<'BOX'
+  ╔════════════════════════════════════════════════════════════╗
+  ║  ⚠  ОБНОВЛЕНИЕ ДИСТРИБУТИВА DEBIAN                         ║
+  ║                                                            ║
+  ║  • Операция необратима — сделайте снапшот заранее.         ║
+  ║  • После каждого шага сервер перезагружается.              ║
+  ║  • Сторонние репозитории будут временно отключены.         ║
+  ║  • Не отключайте питание во время работы скрипта.          ║
+  ╚════════════════════════════════════════════════════════════╝
+BOX
+    printf '%s\n' "${C_NC}"
 }
 
-# ── Основная логика ──────────────────────────────────────────────────────────
-module_system_update() {
+# ── Основная логика ───────────────────────────────────────────────────────────
+main() {
+    parse_args "$@"
+
+    case "${MODE}" in
+        status)  preflight; show_status; exit 0 ;;
+        restore) require_root; restore_thirdparty; exit 0 ;;
+        abort)   require_root; remove_resume_service; exit 0 ;;
+    esac
+
     preflight
 
-    local cur; cur="$(current_major)"
-    if [[ -z "${cur}" || -z "${CODENAME[$cur]:-}" ]]; then
-        error "Не удалось определить версию Debian (получено: '${cur}')."
+    local cur; cur="$(os_major)"
+    [[ -n "${cur}" && -n "${CODENAME[${cur}]:-}" ]] \
+        || die "Не удалось определить поддерживаемую версию Debian (получено: '${cur}')"
+
+    # ── resume: вызов из systemd после перезагрузки ───────────────────────────
+    if [[ "${MODE}" == "resume" ]]; then
+        [[ -f "${STATE_FILE}" ]] && { source "${STATE_FILE}"; TARGET="${TARGET:-13}"; }
+        info "[resume] Debian ${cur} (${CODENAME[${cur}]}) → цель Debian ${TARGET}"
+        if [[ "${cur}" -ge "${TARGET}" ]]; then
+            success "Цель достигнута: Debian ${cur}."
+            remove_resume_service
+            if [[ -f "${REPO_LIST}" ]]; then
+                warn "Остались отключённые сторонние репозитории."
+                info "Вернуть их:  bash modules/00-system-update.sh --restore-repos"
+            fi
+            ulog "chain finished at ${cur}"
+            exit 0
+        fi
+        if upgrade_one_hop "${cur}"; then
+            do_reboot
+        else
+            pause_auto
+            exit 1
+        fi
+        exit 0
+    fi
+
+    # ── Уже на цели ───────────────────────────────────────────────────────────
+    if [[ "${cur}" -ge "${TARGET}" ]]; then
+        success "Система уже на Debian ${cur} — обновление не требуется."
+        [[ -f "${STATE_FILE}" ]] && remove_resume_service
+        exit 0
+    fi
+
+    warning_box
+    info "Текущая версия: Debian ${cur} (${CODENAME[${cur}]})"
+    info "Целевая версия: Debian ${TARGET} (${CODENAME[${TARGET}]})"
+    info "Маршрут:        $(route_string "${cur}" "${TARGET}")"
+    echo
+
+    # ── auto ──────────────────────────────────────────────────────────────────
+    if [[ "${MODE}" == "auto" ]]; then
+        require_systemd
+        confirm "Запустить автоматическое обновление Debian ${cur} → ${TARGET} с перезагрузками?" no \
+            || { info "Отменено."; exit 0; }
+        disable_thirdparty
+        install_resume_service
+        if upgrade_one_hop "${cur}"; then
+            do_reboot
+        else
+            pause_auto
+            exit 1
+        fi
+        exit 0
+    fi
+
+    # ── manual: ровно один шаг ────────────────────────────────────────────────
+    local next=$(( cur + 1 ))
+    confirm "Выполнить ОДИН шаг: Debian ${cur} → ${next} (${CODENAME[${next}]})?" no \
+        || { info "Отменено."; exit 0; }
+
+    disable_thirdparty
+    if ! upgrade_one_hop "${cur}"; then
+        error "Шаг не выполнен. Разберите ошибки в ${UPGRADE_LOG} и запустите снова."
         exit 1
     fi
 
-    # ── РЕЖИМ: статус ────────────────────────────────────────────────────────
-    if [[ "${MODE}" == "status" ]]; then
-        show_status
-        return 0
+    echo
+    if [[ ${next} -ge ${TARGET} ]]; then
+        success "Финальный шаг. После перезагрузки система будет на Debian ${next}."
+        info "Затем можно запускать модули настройки:  bash main.sh"
+    else
+        info "После перезагрузки запустите скрипт снова: Debian ${next} → $(( next + 1 ))."
     fi
-
-    # ── РЕЖИМ: resume (из systemd после ребута) ─────────────────────────────
-    if [[ "${MODE}" == "resume" ]]; then
-        [[ -f "${STATE_FILE}" ]] && source "${STATE_FILE}"
-        TARGET="${TARGET:-$DEFAULT_TARGET}"
-        info "[resume] Текущая: Debian ${cur} (${CODENAME[$cur]}) | Цель: Debian ${TARGET}"
-        if [[ "${cur}" -ge "${TARGET}" ]]; then
-            success "Цель достигнута: Debian ${cur}. Завершаем авто-обновление."
-            remove_resume_service
-            _ulog "chain finished at ${cur}"
-            return 0
-        fi
-        if upgrade_one_hop "${cur}"; then
-            do_reboot
-        else
-            error "Шаг апгрейда завершился с ошибкой. Авто-цикл остановлен."
-            warn  "Разберитесь вручную, затем: ${SELF_INSTALL} --resume  (или отключите: systemctl disable ${SERVICE_NAME})"
-            _ulog "hop failed at ${cur}, auto paused"
-            return 1
-        fi
-        return 0
-    fi
-
-    # Уже на цели?
-    if [[ "${cur}" -ge "${TARGET}" ]]; then
-        success "Система уже на Debian ${cur} — обновление до ${TARGET} не требуется."
-        return 0
-    fi
-
-    # Предупреждение
-    echo ""
-    echo -e "${YELLOW}  ╔════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${YELLOW}  ║  ⚠  ПОЭТАПНОЕ ОБНОВЛЕНИЕ ДИСТРИБУТИВА DEBIAN               ║${NC}"
-    echo -e "${YELLOW}  ║                                                            ║${NC}"
-    echo -e "${YELLOW}  ║  • Операция НЕОБРАТИМА — сделайте снапшот/бэкап заранее!   ║${NC}"
-    echo -e "${YELLOW}  ║  • После каждого шага будет ПЕРЕЗАГРУЗКА.                  ║${NC}"
-    echo -e "${YELLOW}  ║  • Сторонние репозитории будут временно отключены.        ║${NC}"
-    echo -e "${YELLOW}  ╚════════════════════════════════════════════════════════════╝${NC}"
-    echo ""
-    info "Текущая версия: Debian ${cur} (${CODENAME[$cur]})"
-    info "Целевая версия: Debian ${TARGET} (${CODENAME[$TARGET]})"
-    info "Маршрут: $(s=${cur}; out=""; while [[ ${s} -le ${TARGET} ]]; do out+="${s} "; s=$((s+1)); done; echo "${out}" | sed 's/ /→/g; s/→$//')"
-    echo ""
-
-    disable_thirdparty
-
-    # ── РЕЖИМ: auto (весь путь с авто-ребутами) ─────────────────────────────
-    if [[ "${MODE}" == "auto" ]]; then
-        if ! command -v systemctl >/dev/null 2>&1; then
-            error "Авто-режим требует systemd. Используйте ручной режим (без --auto)."
-            exit 1
-        fi
-        confirm "Запустить АВТОМАТИЧЕСКОЕ обновление Debian ${cur} → ${TARGET} с перезагрузками?" || { info "Отменено."; return 0; }
-        install_resume_service "${TARGET}"
-        if upgrade_one_hop "${cur}"; then
-            do_reboot     # дальше эстафету подхватит systemd → --resume
-        else
-            error "Первый шаг не удался. Авто-сервис установлен, но приостановлен."
-            return 1
-        fi
-        return 0
-    fi
-
-    # ── РЕЖИМ: manual (один шаг) ─────────────────────────────────────────────
-    confirm "Выполнить ОДИН шаг: Debian ${cur} → $((cur+1)) (${CODENAME[$((cur+1))]})?" || { info "Отменено."; return 0; }
-    if upgrade_one_hop "${cur}"; then
-        echo ""
-        local next=$(( cur + 1 ))
-        if [[ ${next} -ge ${TARGET} ]]; then
-            success "Это был финальный шаг. После перезагрузки система будет на Debian ${next}."
-        else
-            info "После перезагрузки ЗАПУСТИТЕ СКРИПТ СНОВА, чтобы продолжить: Debian ${next} → $((next+1))."
-        fi
-        echo ""
-        if confirm "Перезагрузить сейчас?"; then
-            do_reboot
-        else
-            warn "Не забудьте перезагрузиться вручную: sudo reboot"
-        fi
+    echo
+    if confirm "Перезагрузить сейчас?" yes; then
+        do_reboot
+    else
+        warn "Не забудьте перезагрузиться вручную: reboot"
     fi
 }
 
-parse_args "$@"
-module_system_update
+main "$@"

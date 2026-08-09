@@ -1,66 +1,81 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # ==============================================================================
-# Module 03: Синхронизация времени (chrony)
-# Поддержка: Debian 9 / 10 / 11 / 12 / 13
+# Модуль 03 — Часовой пояс и синхронизация времени (chrony)
+# Платформа: Debian 13 (trixie)
 # ==============================================================================
 
-if ! declare -f info > /dev/null 2>&1; then
-    RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
-    CYAN='\033[0;36m'; NC='\033[0m'
-    info()    { echo -e "${CYAN} ℹ ${*}${NC}"; }
-    warn()    { echo -e "${YELLOW} ⚠ ${*}${NC}"; }
-    success() { echo -e "${GREEN} ✓ ${*}${NC}"; }
-    error()   { echo -e "${RED} ✗ ${*}${NC}"; exit 1; }
+set -Eeuo pipefail
+_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../lib/common.sh
+source "${_DIR}/../lib/common.sh"
+load_settings
+trap_setup "03-time-sync"
+require_root
+require_debian_13
+
+TZ_WANT="${TIMEZONE:-Europe/Moscow}"
+
+step "Синхронизация времени"
+
+# ── Часовой пояс ──────────────────────────────────────────────────────────────
+if [[ ! -f "/usr/share/zoneinfo/${TZ_WANT}" ]]; then
+    die "Часовой пояс '${TZ_WANT}' не найден в /usr/share/zoneinfo"
 fi
 
-if [[ -z "${TIMEZONE:-}" ]]; then
-    _BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-    [[ -f "${_BASE_DIR}/config/settings.conf" ]] && source "${_BASE_DIR}/config/settings.conf"
+info "Устанавливаем часовой пояс: ${TZ_WANT}"
+if systemd_present && have timedatectl && timedatectl set-timezone "${TZ_WANT}" 2>/dev/null; then
+    debug "Часовой пояс задан через timedatectl"
+else
+    # Контейнеры и окружения без работающего systemd
+    warn "timedatectl недоступен — задаём часовой пояс напрямую"
+    ln -sf "/usr/share/zoneinfo/${TZ_WANT}" /etc/localtime
+    printf '%s\n' "${TZ_WANT}" > /etc/timezone
+    have dpkg-reconfigure && DEBIAN_FRONTEND=noninteractive dpkg-reconfigure -f noninteractive tzdata >/dev/null 2>&1 || true
 fi
 
-module_time_sync() {
-    info "Настройка синхронизации времени..."
+# ── chrony ────────────────────────────────────────────────────────────────────
+if ! pkg_installed chrony; then
+    info "Устанавливаем chrony..."
+    apt_update >/dev/null || warn "apt-get update завершился с ошибкой"
+    apt_install chrony
+fi
 
-    local tz="${TIMEZONE:-Europe/Moscow}"
+if ! systemd_present; then
+    warn "systemd отсутствует — служба времени не будет запущена автоматически"
+    success "Часовой пояс установлен: ${TZ_WANT}"
+    exit 0
+fi
 
-    export DEBIAN_FRONTEND=noninteractive
-
-    # Устанавливаем chrony (точнее и надёжнее, чем systemd-timesyncd)
-    info "Установка chrony..."
-    apt-get install -y chrony
-
-    # Отключаем системный timesyncd (конфликтует с chrony)
-    if systemctl is-active --quiet systemd-timesyncd 2>/dev/null; then
-        info "Отключаем systemd-timesyncd..."
-        systemctl disable --now systemd-timesyncd 2>/dev/null || true
+# systemd-timesyncd конфликтует с chrony за порт 123
+if unit_exists systemd-timesyncd.service; then
+    if svc_active systemd-timesyncd || svc_enabled systemd-timesyncd; then
+        info "Отключаем systemd-timesyncd (конфликтует с chrony)"
+        systemctl disable --now systemd-timesyncd >/dev/null 2>&1 || true
     fi
+fi
 
-    # Устанавливаем часовой пояс
-    info "Установка часового пояса: ${tz}..."
-    timedatectl set-timezone "${tz}"
+# В Debian служба называется chrony.service, но встречается алиас chronyd
+CHRONY_UNIT="chrony.service"
+unit_exists "${CHRONY_UNIT}" || CHRONY_UNIT="chronyd.service"
+unit_exists "${CHRONY_UNIT}" || die "Не найден systemd-юнит chrony"
 
-    # Включаем и запускаем chrony
-    systemctl enable chrony
-    systemctl restart chrony
+info "Запускаем ${CHRONY_UNIT}..."
+svc_enable_now "${CHRONY_UNIT}"
 
-    # Форсируем немедленную синхронизацию
-    sleep 2
-    info "Принудительная синхронизация..."
-    chronyc -a makestep 2>/dev/null || \
-        chronyc makestep 2>/dev/null || \
-        warn "Принудительная синхронизация не удалась (chrony ещё запускается)"
+# Даём демону подняться и форсируем шаговую коррекцию
+sleep 2
+if have chronyc; then
+    chronyc -a makestep >/dev/null 2>&1 \
+        || chronyc makestep >/dev/null 2>&1 \
+        || warn "Немедленная синхронизация не выполнена (chrony ещё стартует)"
+fi
 
-    # Проверка
-    info "Текущее время: $(date)"
-    info "Часовой пояс: $(timedatectl show --property=Timezone --value 2>/dev/null || timedatectl | grep 'Time zone' | awk '{print $3}')"
+if svc_active "${CHRONY_UNIT}"; then
+    success "chrony работает"
+    have chronyc && chronyc tracking 2>/dev/null | sed -n '1,4p' | sed 's/^/   /' || true
+else
+    warn "chrony не запустился. Диагностика: journalctl -u ${CHRONY_UNIT} -n 30"
+fi
 
-    if systemctl is-active --quiet chrony; then
-        success "chrony запущен и синхронизирован"
-    else
-        warn "chrony не запустился — проверьте: journalctl -u chrony"
-    fi
-
-    success "Синхронизация времени настроена"
-}
-
-module_time_sync
+info "Текущее время: $(date '+%Y-%m-%d %H:%M:%S %Z')"
+success "Синхронизация времени настроена (${TZ_WANT})"

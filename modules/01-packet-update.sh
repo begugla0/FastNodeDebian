@@ -1,63 +1,49 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # ==============================================================================
-# Module 01: Обновление пакетов системы
-# Поддержка: Debian 9 / 10 / 11 / 12 / 13
+# Модуль 01 — Обновление пакетов и установка базового набора
+# Платформа: Debian 13 (trixie)
 # ==============================================================================
 
-if ! declare -f info > /dev/null 2>&1; then
-    RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
-    CYAN='\033[0;36m'; NC='\033[0m'
-    info()    { echo -e "${CYAN} ℹ ${*}${NC}"; }
-    warn()    { echo -e "${YELLOW} ⚠ ${*}${NC}"; }
-    success() { echo -e "${GREEN} ✓ ${*}${NC}"; }
-    error()   { echo -e "${RED} ✗ ${*}${NC}"; exit 1; }
+set -Eeuo pipefail
+_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../lib/common.sh
+source "${_DIR}/../lib/common.sh"
+load_settings
+trap_setup "01-packet-update"
+require_root
+require_debian_13
+
+step "Обновление системы"
+info "Debian $(os_major) ($(os_codename)), ядро $(uname -r)"
+
+# Приводим dpkg в согласованное состояние: иначе любая последующая установка
+# упадёт с «dpkg was interrupted».
+dpkg --configure -a >/dev/null 2>&1 || warn "dpkg --configure -a вернул ошибку"
+apt-get -f install -y "${APT_CONF_OPTS[@]}" >/dev/null 2>&1 || true
+
+info "Обновление списков пакетов..."
+apt_update >/dev/null || die "apt-get update не выполнен — проверьте /etc/apt/sources.list и сеть"
+
+info "Обновление установленных пакетов..."
+apt-get upgrade -y "${APT_CONF_OPTS[@]}"
+
+info "Full-upgrade (разрешение зависимостей)..."
+apt-get full-upgrade -y "${APT_CONF_OPTS[@]}"
+
+# Базовый набор. apt_install сам отсеивает пакеты, которых нет в релизе, —
+# раньше один отсутствующий пакет срывал установку всего списка.
+if declare -p REQUIRED_PACKAGES >/dev/null 2>&1 && (( ${#REQUIRED_PACKAGES[@]} > 0 )); then
+    info "Установка базовых пакетов (${#REQUIRED_PACKAGES[@]} шт.)..."
+    apt_install "${REQUIRED_PACKAGES[@]}"
 fi
 
-if [[ -z "${REQUIRED_PACKAGES[*]:-}" ]]; then
-    _BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-    [[ -f "${_BASE_DIR}/config/settings.conf" ]] && source "${_BASE_DIR}/config/settings.conf"
+info "Очистка..."
+apt-get --purge autoremove -y "${APT_CONF_OPTS[@]}" >/dev/null
+apt-get autoclean -y >/dev/null
+
+# Сообщаем, если требуется перезагрузка (обновилось ядро или libc)
+if [[ -f /var/run/reboot-required ]]; then
+    warn "Система сообщает: требуется перезагрузка (обновлено ядро или системные библиотеки)"
 fi
 
-module_packet_update() {
-    info "Обновление системных пакетов..."
-
-    if ! grep -qi "debian" /etc/os-release 2>/dev/null && [[ ! -r /etc/debian_version ]]; then
-        warn "Скрипт оптимизирован для Debian, продолжаем..."
-    fi
-
-    local ver codename
-    ver="$(. /etc/os-release 2>/dev/null; echo "${VERSION_ID:-?}")"
-    codename="$(. /etc/os-release 2>/dev/null; echo "${VERSION_CODENAME:-?}")"
-    info "Версия Debian: ${ver} (${codename})"
-
-    export DEBIAN_FRONTEND=noninteractive
-
-    info "Обновление списков пакетов..."
-    apt-get update -y || { warn "apt-get update завершился с ошибкой, продолжаем..."; }
-
-    info "Обновление установленных пакетов..."
-    apt-get upgrade -y \
-        -o Dpkg::Options::="--force-confold" \
-        -o Dpkg::Options::="--force-confdef"
-
-    info "Full-upgrade (зависимости)..."
-    apt-get full-upgrade -y \
-        -o Dpkg::Options::="--force-confold" \
-        -o Dpkg::Options::="--force-confdef"
-
-    if [[ ${#REQUIRED_PACKAGES[@]} -gt 0 ]]; then
-        info "Установка базовых пакетов: ${REQUIRED_PACKAGES[*]}"
-        apt-get install -y "${REQUIRED_PACKAGES[@]}" \
-            -o Dpkg::Options::="--force-confold" \
-            -o Dpkg::Options::="--force-confdef" \
-            || warn "Часть пакетов не установилась (возможно, недоступны в этом релизе)"
-    fi
-
-    info "Очистка кэша..."
-    apt-get autoremove -y
-    apt-get autoclean -y
-
-    success "Система обновлена (Debian ${ver})"
-}
-
-module_packet_update
+success "Пакеты обновлены"

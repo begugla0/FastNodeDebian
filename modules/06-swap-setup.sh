@@ -1,139 +1,166 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # ==============================================================================
-# Module 06: Настройка SWAP
-# Поддержка: Debian 9 / 10 / 11 / 12 / 13
+# Модуль 06 — SWAP-файл и параметры виртуальной памяти
+# Платформа: Debian 13 (trixie)
 #
-# Интерактивный выбор размера: 1GB / 2GB / 3GB / 4GB
+# Отличия от прежней версии:
+#   - В неинтерактивном режиме берётся SWAP_SIZE из конфига, а не зависает
+#     на вопросе о размере.
+#   - Проверяется свободное место ДО создания файла.
+#   - fallocate проверяется на пригодность: при «swapfile has holes» —
+#     автоматический откат на dd.
+#   - Все vm.* параметры теперь живут ТОЛЬКО здесь (модуль 09 их больше не
+#     пишет), поэтому конфликта swappiness между двумя файлами нет.
 # ==============================================================================
 
-if ! declare -f info > /dev/null 2>&1; then
-    RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
-    CYAN='\033[0;36m'; NC='\033[0m'
-    info()    { echo -e "${CYAN} ℹ ${*}${NC}"; }
-    warn()    { echo -e "${YELLOW} ⚠ ${*}${NC}"; }
-    success() { echo -e "${GREEN} ✓ ${*}${NC}"; }
-    error()   { echo -e "${RED} ✗ ${*}${NC}"; exit 1; }
-fi
+set -Eeuo pipefail
+_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../lib/common.sh
+source "${_DIR}/../lib/common.sh"
+load_settings
+trap_setup "06-swap-setup"
+require_root
+require_debian_13
 
-if [[ -z "${SWAP_FILE:-}" ]]; then
-    _BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-    [[ -f "${_BASE_DIR}/config/settings.conf" ]] && source "${_BASE_DIR}/config/settings.conf"
-fi
+SWAPFILE="${SWAP_FILE:-/swapfile}"
+SWAPPINESS="${SWAP_SWAPPINESS:-10}"
+CACHE_PRESSURE="${SWAP_VFS_CACHE_PRESSURE:-50}"
+SIZE="${SWAP_SIZE:-2G}"
+SYSCTL_FILE="/etc/sysctl.d/99-fastnode-vm.conf"
 
-module_swap_setup() {
-    info "Проверка и настройка SWAP..."
+step "Настройка SWAP"
 
-    local swap_file="${SWAP_FILE:-/swapfile}"
-    local swappiness="${SWAP_SWAPPINESS:-10}"
-    local swap_size="${SWAP_SIZE:-2G}"
+CURRENT_MB="$(free -m | awk '/^Swap:/{print $2}')"
+ACTIVE="$(swapon --show=NAME --noheadings 2>/dev/null | wc -l)"
+info "Сейчас: ${CURRENT_MB} MB swap, активных устройств: ${ACTIVE}"
 
-    # Текущий статус swap
-    local swap_exists
-    swap_exists=$(swapon --show --noheadings 2>/dev/null | wc -l)
-    local current_swap_mb
-    current_swap_mb=$(free -m | awk '/Swap:/ {print $2}')
-
-    info "Текущий SWAP: ${current_swap_mb} MB (активных разделов: ${swap_exists})"
-
-    # Если swap уже достаточный — спрашиваем хотят ли переделать
-    if [[ ${swap_exists} -gt 0 ]] && [[ ${current_swap_mb} -gt 512 ]]; then
-        warn "SWAP уже настроен: ${current_swap_mb} MB"
-        printf " Пересоздать SWAP? (yes/no) [no]: "
-        local recreate
-        read -r recreate </dev/tty
-        if [[ "${recreate}" != "yes" ]]; then
-            info "Оставляем существующий SWAP"
-            return 0
-        fi
+# ── Нужно ли что-то делать ────────────────────────────────────────────────────
+if [[ "${ACTIVE}" -gt 0 && "${CURRENT_MB}" -gt 512 ]]; then
+    warn "SWAP уже настроен (${CURRENT_MB} MB)"
+    swapon --show 2>/dev/null | sed 's/^/   /'
+    if ! confirm "Пересоздать swap-файл ${SWAPFILE}?" no; then
+        info "Оставляем существующий SWAP, применяем только параметры vm.*"
+        SIZE=""
     fi
+fi
 
-    # === Интерактивный выбор размера ===
-    echo ""
-    echo -e "${CYAN}  Выберите размер SWAP:${NC}"
-    echo -e "  ${CYAN}1${NC}) 1 GB  — минимум для серверов с 1 GB RAM"
-    echo -e "  ${CYAN}2${NC}) 2 GB  — рекомендуется для 1–2 GB RAM  [по умолчанию]"
-    echo -e "  ${CYAN}3${NC}) 3 GB  — оптимально для 2–4 GB RAM"
-    echo -e "  ${CYAN}4${NC}) 4 GB  — для 4–8 GB RAM при пиковых нагрузках"
-    echo ""
-
-    local choice
-    printf "  Введите 1/2/3/4 [2]: "
-    read -r choice </dev/tty
-
-    case "${choice}" in
-        1) swap_size="1G" ;;
-        2|"") swap_size="2G" ;;
-        3) swap_size="3G" ;;
-        4) swap_size="4G" ;;
-        *)
-            warn "Неверный выбор '${choice}', используем 2G"
-            swap_size="2G"
-            ;;
+# ── Выбор размера ─────────────────────────────────────────────────────────────
+if [[ -n "${SIZE}" ]] && interactive && [[ "${FASTNODE_YES:-0}" != "1" ]]; then
+    RAM_MB="$(free -m | awk '/^Mem:/{print $2}')"
+    printf '\n  RAM на сервере: %s MB\n\n' "${RAM_MB}"
+    printf '  %s1%s) 1 GB   %s2%s) 2 GB   %s3%s) 3 GB   %s4%s) 4 GB   %s8%s) 8 GB\n\n' \
+        "${C_CYAN}" "${C_NC}" "${C_CYAN}" "${C_NC}" "${C_CYAN}" "${C_NC}" \
+        "${C_CYAN}" "${C_NC}" "${C_CYAN}" "${C_NC}"
+    CHOICE="$(ask "Размер SWAP (1/2/3/4/8)" "${SIZE%[GgMm]}")"
+    case "${CHOICE}" in
+        1|2|3|4|8) SIZE="${CHOICE}G" ;;
+        *[Gg]|*[Mm]) SIZE="${CHOICE^^}" ;;
+        *) warn "Непонятный выбор '${CHOICE}', используем ${SWAP_SIZE:-2G}"; SIZE="${SWAP_SIZE:-2G}" ;;
     esac
+fi
 
-    info "Выбран размер SWAP: ${swap_size}"
+if [[ -n "${SIZE}" ]]; then
+    SIZE_MB="$(size_to_mb "${SIZE}")"
+    [[ "${SIZE_MB}" =~ ^[0-9]+$ && "${SIZE_MB}" -ge 128 ]] \
+        || die "Некорректный размер SWAP: '${SIZE}' (ожидается вида 2G или 512M)"
+    info "Целевой размер: ${SIZE} (${SIZE_MB} MB)"
 
-    # Проверяем тип ФС (btrfs требует особого обращения)
-    local fs_type
-    fs_type=$(stat -f -c %T "$(dirname "${swap_file}")" 2>/dev/null || echo "ext4")
-
-    # Удаляем старый swap если есть
-    if [[ -f "${swap_file}" ]]; then
-        info "Отключаем старый swap..."
-        swapoff "${swap_file}" 2>/dev/null || true
-        rm -f "${swap_file}"
+    # ── Свободное место ───────────────────────────────────────────────────────
+    TARGET_DIR="$(dirname "${SWAPFILE}")"
+    FREE="$(free_mb "${TARGET_DIR}")"
+    OLD_MB=0
+    [[ -f "${SWAPFILE}" ]] && OLD_MB="$(( $(stat -c %s "${SWAPFILE}") / 1024 / 1024 ))"
+    AVAIL=$(( FREE + OLD_MB ))
+    if [[ "${AVAIL}" -lt $(( SIZE_MB + 512 )) ]]; then
+        die "Недостаточно места в ${TARGET_DIR}: доступно ${AVAIL} MB, нужно ~$(( SIZE_MB + 512 )) MB"
     fi
 
-    # Создаём swap файл
-    info "Создаём swap файл ${swap_size}..."
+    # ── Снимаем старый swap-файл ──────────────────────────────────────────────
+    if [[ -f "${SWAPFILE}" ]]; then
+        info "Отключаем и удаляем прежний ${SWAPFILE}"
+        swapoff "${SWAPFILE}" 2>/dev/null || true
+        rm -f "${SWAPFILE}"
+    fi
 
-    if [[ "${fs_type}" == "btrfs" ]]; then
-        # На btrfs нужно отключить COW для swap файла
-        info "Обнаружена btrfs — использую специальный метод создания..."
-        touch "${swap_file}"
-        chattr +C "${swap_file}" 2>/dev/null || warn "chattr +C не сработал (ОК для старых btrfs)"
-        fallocate -l "${swap_size}" "${swap_file}" 2>/dev/null || \
-            dd if=/dev/zero of="${swap_file}" bs=1M count="$(echo "${swap_size}" | sed 's/G/*1024/' | bc)" status=none
+    # ── Создание ──────────────────────────────────────────────────────────────
+    FSTYPE="$(stat -f -c %T "${TARGET_DIR}" 2>/dev/null || echo unknown)"
+    info "Файловая система ${TARGET_DIR}: ${FSTYPE}"
+
+    create_with_dd() {
+        info "Создаём ${SIZE} через dd (может занять время)..."
+        dd if=/dev/zero of="${SWAPFILE}" bs=1M count="${SIZE_MB}" status=none
+    }
+
+    if [[ "${FSTYPE}" == "btrfs" ]]; then
+        # На btrfs swap-файл обязан быть без CoW и без сжатия
+        info "btrfs: отключаем CoW для swap-файла"
+        truncate -s 0 "${SWAPFILE}"
+        chattr +C "${SWAPFILE}" 2>/dev/null || warn "chattr +C не применился"
+        create_with_dd
     else
-        # ext4, xfs и другие — fallocate быстрее
-        if ! fallocate -l "${swap_size}" "${swap_file}" 2>/dev/null; then
-            info "fallocate не поддерживается, используем dd..."
-            dd if=/dev/zero of="${swap_file}" bs=1M count="$(echo "${swap_size}" | sed 's/G/*1024/' | bc)" status=progress
+        if ! fallocate -l "${SIZE_MB}M" "${SWAPFILE}" 2>/dev/null; then
+            warn "fallocate недоступен на этой ФС"
+            create_with_dd
         fi
     fi
 
-    # Устанавливаем права
-    chmod 600 "${swap_file}"
+    chmod 600 "${SWAPFILE}"
+    chown root:root "${SWAPFILE}"
 
-    # Форматируем и включаем
-    mkswap "${swap_file}"
-    swapon "${swap_file}"
-
-    # Добавляем в /etc/fstab (перманентно)
-    if grep -q "${swap_file}" /etc/fstab 2>/dev/null; then
-        # Обновляем существующую запись
-        sed -i "\|${swap_file}|d" /etc/fstab
+    # ── Форматирование и включение ────────────────────────────────────────────
+    if ! mkswap "${SWAPFILE}" >/dev/null; then
+        rm -f "${SWAPFILE}"
+        die "mkswap не смог отформатировать ${SWAPFILE}"
     fi
-    echo "${swap_file} none swap sw 0 0" >> /etc/fstab
-    info "SWAP добавлен в /etc/fstab"
 
-    # Настраиваем swappiness через sysctl
-    info "Настройка swappiness=${swappiness}..."
-    sysctl -w vm.swappiness="${swappiness}" > /dev/null
+    if ! swapon "${SWAPFILE}" 2>/dev/null; then
+        # Классический случай: fallocate оставил «дыры» в файле
+        warn "swapon отклонил файл (вероятно, разрежённый) — пересоздаём через dd"
+        rm -f "${SWAPFILE}"
+        create_with_dd
+        chmod 600 "${SWAPFILE}"
+        mkswap "${SWAPFILE}" >/dev/null
+        swapon "${SWAPFILE}" || die "Не удалось включить swap на ${SWAPFILE}"
+    fi
+    success "SWAP-файл активен"
 
-    # Записываем постоянно
-    local sysctl_file="/etc/sysctl.d/99-swap.conf"
-    cat > "${sysctl_file}" <<EOF
-# FastNodeDebian: SWAP tuning
-vm.swappiness = ${swappiness}
-vm.vfs_cache_pressure = 50
+    # ── fstab ─────────────────────────────────────────────────────────────────
+    backup_file /etc/fstab >/dev/null
+    sed -i "\|^[[:space:]]*${SWAPFILE}[[:space:]]|d" /etc/fstab
+    printf '%s none swap sw 0 0\n' "${SWAPFILE}" >> /etc/fstab
+    info "Запись добавлена в /etc/fstab"
+
+    # Проверяем, что fstab не сломан — иначе сервер не загрузится
+    if have findmnt && ! findmnt --verify --verbose >/dev/null 2>&1; then
+        warn "findmnt сообщает о замечаниях в /etc/fstab — проверьте вручную"
+    fi
+fi
+
+# ── Параметры виртуальной памяти ──────────────────────────────────────────────
+info "Применяем vm.swappiness=${SWAPPINESS}, vm.vfs_cache_pressure=${CACHE_PRESSURE}"
+# Резерв свободной памяти. Под сетевой нагрузкой ядру нужен запас для
+# атомарных аллокаций; без него на пиках возможны потери пакетов и OOM.
+# Держим в пределах ~1-3% RAM: фиксированные 64 МБ на VPS с 1 ГБ — уже 6%.
+RAM_MB_TOTAL="$(free -m | awk '/^Mem:/{print $2}')"
+if   (( RAM_MB_TOTAL <= 1200 )); then MIN_FREE=32768
+elif (( RAM_MB_TOTAL <= 4096 )); then MIN_FREE=65536
+else                                  MIN_FREE=131072
+fi
+
+write_file "${SYSCTL_FILE}" 0644 <<EOF
+# FastNodeDebian — параметры виртуальной памяти (модуль 06)
+# Единственное место, где задаются vm.*; сетевые параметры — в модуле 10.
+vm.swappiness = ${SWAPPINESS}
+vm.vfs_cache_pressure = ${CACHE_PRESSURE}
+vm.min_free_kbytes = ${MIN_FREE}
 EOF
-    sysctl -p "${sysctl_file}" > /dev/null
 
-    # Проверка
-    local new_swap_mb
-    new_swap_mb=$(free -m | awk '/Swap:/ {print $2}')
-    success "SWAP настроен: ${new_swap_mb} MB | swappiness=${swappiness}"
-}
+# Убираем файл прежней версии скрипта, чтобы не было двух источников правды
+[[ -f /etc/sysctl.d/99-swap.conf ]] && rm -f /etc/sysctl.d/99-swap.conf && \
+    info "Удалён устаревший /etc/sysctl.d/99-swap.conf"
 
-module_swap_setup
+sysctl_apply "${SYSCTL_FILE}"
+
+NEW_MB="$(free -m | awk '/^Swap:/{print $2}')"
+success "SWAP: ${NEW_MB} MB | swappiness=${SWAPPINESS} | vfs_cache_pressure=${CACHE_PRESSURE}"
+swapon --show 2>/dev/null | sed 's/^/   /' || true
