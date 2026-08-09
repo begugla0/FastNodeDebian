@@ -334,73 +334,135 @@ EOF
 fi
 
 # ── 10. Локальный кеширующий DNS ──────────────────────────────────────────────
+# Принцип: системный резолвер НЕ переключается, пока кеш не доказал, что
+# отвечает. Прежняя версия сначала переписывала /etc/resolv.conf и только потом
+# проверяла результат — при неудаче узел оставался без DNS, а симлинк на
+# systemd-resolved уничтожался безвозвратно.
+DNS_FAILED=0
 if [[ "${TUNE_DNS_CACHE:-no}" == "yes" ]]; then
     step "Локальный DNS-кеш (dnsmasq)"
-    apt_update >/dev/null || warn "apt-get update завершился с ошибкой"
-    apt_install dnsmasq
 
+    # ── Точный снимок исходного состояния ────────────────────────────────────
+    RESOLV_WAS_LINK=0
+    RESOLV_LINK_TARGET=""
     RESOLV_BACKUP=""
     if [[ -L /etc/resolv.conf ]]; then
-        RESOLV_LINK="$(readlink -f /etc/resolv.conf || true)"
-        info "/etc/resolv.conf — симлинк на ${RESOLV_LINK}"
-    else
+        RESOLV_WAS_LINK=1
+        RESOLV_LINK_TARGET="$(readlink /etc/resolv.conf || true)"
+        info "/etc/resolv.conf — симлинк на ${RESOLV_LINK_TARGET}"
+    elif [[ -f /etc/resolv.conf ]]; then
         RESOLV_BACKUP="$(backup_file /etc/resolv.conf)"
+        info "Резервная копия резолвера: ${RESOLV_BACKUP}"
     fi
 
-    # "${ARR[@]:-a b}" при пустом массиве даёт ОДИН элемент "a b",
-    # и в конфиг dnsmasq попадает строка «server=1.1.1.1 8.8.8.8».
-    declare -a UPSTREAM=()
-    if declare -p TUNE_DNS_UPSTREAM >/dev/null 2>&1 && (( ${#TUNE_DNS_UPSTREAM[@]} > 0 )); then
-        UPSTREAM=("${TUNE_DNS_UPSTREAM[@]}")
-    else
-        UPSTREAM=(1.1.1.1 1.0.0.1 8.8.8.8)
-    fi
-    {
-        printf '# FastNodeDebian — кеширующий резолвер (модуль 10)\n'
-        printf 'listen-address=127.0.0.1\nbind-interfaces\nno-resolv\nno-hosts\n'
-        printf 'cache-size=20000\nmin-cache-ttl=120\nneg-ttl=60\ndns-forward-max=2000\nall-servers\n'
-        for u in "${UPSTREAM[@]}"; do printf 'server=%s\n' "${u}"; done
-    } | write_file "${DNSMASQ_CONF}" 0644
-
-    if unit_exists systemd-resolved.service && svc_active systemd-resolved; then
-        info "Останавливаем systemd-resolved (занимает порт 53)"
-        systemctl disable --now systemd-resolved >/dev/null 2>&1 || true
-        RESOLVED_WAS=1
-    else
-        RESOLVED_WAS=0
-    fi
-
-    rm -f /etc/resolv.conf
-    printf 'nameserver 127.0.0.1\noptions edns0 trust-ad\n' > /etc/resolv.conf
-    chmod 644 /etc/resolv.conf
-
-    systemctl enable dnsmasq >/dev/null 2>&1 || true
-    systemctl restart dnsmasq || true
-    sleep 2
-
-    # Резолвер обязан отвечать — иначе узел останется без DNS
-    DNS_OK=0
-    for _ in 1 2 3; do
-        if getent hosts deb.debian.org >/dev/null 2>&1; then DNS_OK=1; break; fi
-        sleep 2
-    done
-
-    if [[ ${DNS_OK} -eq 1 ]]; then
-        success "dnsmasq отвечает, DNS переключён на 127.0.0.1"
-        info "Файл /etc/resolv.conf намеренно НЕ помечен immutable:"
-        info "  chattr +i мешает восстановлению DNS и путает при диагностике."
-    else
-        warn "Резолвер не отвечает — откатываем DNS"
-        rm -f "${DNSMASQ_CONF}"
-        systemctl disable --now dnsmasq >/dev/null 2>&1 || true
+    restore_resolver() {
         rm -f /etc/resolv.conf
-        if [[ -n "${RESOLV_BACKUP}" && -f "${RESOLV_BACKUP}" ]]; then
+        if [[ ${RESOLV_WAS_LINK} -eq 1 && -n "${RESOLV_LINK_TARGET}" ]]; then
+            ln -sfn "${RESOLV_LINK_TARGET}" /etc/resolv.conf
+            info "Симлинк /etc/resolv.conf → ${RESOLV_LINK_TARGET} восстановлен"
+        elif [[ -n "${RESOLV_BACKUP}" && -f "${RESOLV_BACKUP}" ]]; then
             cp -a "${RESOLV_BACKUP}" /etc/resolv.conf
+            info "Файл /etc/resolv.conf восстановлен из ${RESOLV_BACKUP}"
         else
+            # Исходного состояния не было — только тогда пишем что-то своё
             printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' > /etc/resolv.conf
+            warn "Исходный резолвер неизвестен, записаны публичные серверы"
         fi
-        [[ ${RESOLVED_WAS} -eq 1 ]] && systemctl enable --now systemd-resolved >/dev/null 2>&1 || true
-        error "DNS-кеш не включён, прежние настройки восстановлены."
+        if [[ "${RESOLVED_WAS:-0}" -eq 1 ]]; then
+            systemctl enable --now systemd-resolved >/dev/null 2>&1 || true
+            info "systemd-resolved снова запущен"
+        fi
+    }
+
+    # Опрос конкретного сервера, а не «как получится через nsswitch»
+    # Возвращает: 0 — сервер ответил, 1 — не ответил, 2 — проверить нечем.
+    # Вывод читается в переменную: конвейер «dig | grep -q» под pipefail
+    # ложно падает по SIGPIPE, когда grep выходит по первому совпадению.
+    probe_dns() {   # probe_dns <сервер>
+        local srv="$1" name="deb.debian.org" out
+        if have dig; then
+            out="$(dig +short +time=2 +tries=2 "@${srv}" "${name}" A 2>/dev/null || true)"
+            grep -qE '^[0-9]+\.' <<< "${out}"
+        elif have nslookup; then
+            out="$(nslookup -timeout=2 "${name}" "${srv}" 2>/dev/null || true)"
+            grep -q 'Address' <<< "${out}"
+        else
+            return 2
+        fi
+    }
+
+    apt_update >/dev/null || warn "apt-get update завершился с ошибкой"
+    # dig нужен, чтобы опросить кеш напрямую, минуя /etc/resolv.conf
+    apt_install bind9-dnsutils || warn "bind9-dnsutils не установлен — проверка будет менее точной"
+
+    if ! apt_install dnsmasq; then
+        error "dnsmasq не установился — DNS-кеш не настроен, система не тронута"
+        DNS_FAILED=1
+    else
+        declare -a UPSTREAM=()
+        if declare -p TUNE_DNS_UPSTREAM >/dev/null 2>&1 && (( ${#TUNE_DNS_UPSTREAM[@]} > 0 )); then
+            UPSTREAM=("${TUNE_DNS_UPSTREAM[@]}")
+        else
+            UPSTREAM=(1.1.1.1 1.0.0.1 8.8.8.8)
+        fi
+        {
+            printf '# FastNodeDebian — кеширующий резолвер (модуль 10)\n'
+            printf 'listen-address=127.0.0.1\nbind-interfaces\nno-resolv\nno-hosts\n'
+            printf 'cache-size=20000\nmin-cache-ttl=120\nneg-ttl=60\ndns-forward-max=2000\nall-servers\n'
+            for u in "${UPSTREAM[@]}"; do printf 'server=%s\n' "${u}"; done
+        } | write_file "${DNSMASQ_CONF}" 0644
+
+        # dnsmasq слушает 127.0.0.1:53, systemd-resolved — 127.0.0.53:53.
+        # Адреса разные, поэтому на этом этапе они сосуществуют и системный
+        # резолвер продолжает работать как прежде.
+        systemctl enable dnsmasq >/dev/null 2>&1 || true
+        systemctl restart dnsmasq >/dev/null 2>&1 || true
+        sleep 2
+
+        # $? после «cmd && {...}» относится к списку, а не к cmd — берём код явно
+        PROBE_RC=0
+        for _ in 1 2 3; do
+            probe_rc=0
+            probe_dns 127.0.0.1 || probe_rc=$?
+            (( probe_rc == 0 )) && { PROBE_RC=1; break; }
+            (( probe_rc == 2 )) && { PROBE_RC=2; break; }
+            sleep 2
+        done
+
+        if [[ ${PROBE_RC} -eq 1 ]]; then
+            info "Кеш отвечает на 127.0.0.1 — переключаем системный резолвер"
+            if unit_exists systemd-resolved.service && svc_active systemd-resolved; then
+                systemctl disable --now systemd-resolved >/dev/null 2>&1 || true
+                RESOLVED_WAS=1
+            else
+                RESOLVED_WAS=0
+            fi
+            rm -f /etc/resolv.conf
+            printf 'nameserver 127.0.0.1\noptions edns0 trust-ad\n' > /etc/resolv.conf
+            chmod 644 /etc/resolv.conf
+
+            # Контрольная проверка уже через системный резолвер
+            if getent hosts deb.debian.org >/dev/null 2>&1; then
+                success "DNS-кеш включён, резолвер переключён на 127.0.0.1"
+                info "chattr +i намеренно не применяется: immutable мешает восстановлению DNS"
+            else
+                warn "После переключения резолвинг не работает — полный откат"
+                restore_resolver
+                systemctl disable --now dnsmasq >/dev/null 2>&1 || true
+                rm -f "${DNSMASQ_CONF}"
+                DNS_FAILED=1
+            fi
+        else
+            if [[ ${PROBE_RC} -eq 2 ]]; then
+                warn "Нет dig/nslookup — проверить кеш безопасно нельзя, не рискуем"
+            else
+                warn "Кеш не отвечает на 127.0.0.1 (проверьте доступность ${UPSTREAM[*]})"
+            fi
+            info "Системный резолвер НЕ изменялся — DNS продолжает работать как прежде"
+            systemctl disable --now dnsmasq >/dev/null 2>&1 || true
+            rm -f "${DNSMASQ_CONF}"
+            DNS_FAILED=1
+        fi
     fi
 fi
 
@@ -444,4 +506,12 @@ printf '   ip_forward:   %s\n' "${FORWARD}"
 echo
 info "Проверка:  sysctl net.ipv4.tcp_congestion_control net.core.rmem_max"
 info "Лимиты вступят в силу для служб после перезапуска или перезагрузки."
+
+if (( DNS_FAILED )); then
+    echo
+    error "DNS-кеш включить не удалось — остальной тюнинг применён."
+    info  "Резолвер остался в прежнем состоянии. Отключите TUNE_DNS_CACHE или"
+    info  "проверьте доступность upstream-серверов, затем запустите модуль снова."
+    exit 1
+fi
 exit 0
